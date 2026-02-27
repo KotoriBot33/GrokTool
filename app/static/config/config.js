@@ -17,7 +17,14 @@ const NUMERIC_FIELDS = new Set([
   'reload_interval_sec',
   'solver_threads',
   'register_threads',
-  'default_count'
+  'default_count',
+  'session_ttl_seconds',
+  'session_issue_ip_rate_limit_per_min',
+  'ip_rate_limit_per_min',
+  'session_rate_limit_per_min',
+  'max_messages',
+  'max_input_chars',
+  'max_input_tokens'
 ]);
 
 const LOCALE_MAP = {
@@ -84,6 +91,23 @@ const LOCALE_MAP = {
     "solver_debug": { title: "Solver 调试", desc: "启动 Solver 时开启调试日志。" },
     "max_errors": { title: "最大错误数", desc: "失败次数超过阈值会自动停止注册。0 表示自动计算。"},
     "max_runtime_minutes": { title: "最长运行时间(分钟)", desc: "超过指定分钟数后自动停止注册。0 表示不限制。"}
+  },
+  "public": {
+    "label": "公共聊天",
+    "enabled": { title: "启用公共通道", desc: "关闭后 /api/v1/public/* 不可用，/chat 需使用 API Key。" },
+    "cookie_name": { title: "Cookie 名称", desc: "公共会话 Cookie 名称。" },
+    "session_ttl_seconds": { title: "会话有效期", desc: "公共会话有效期（秒）。" },
+    "hmac_secret": { title: "签名密钥", desc: "可选。为空时回退 app.app_key。" },
+    "session_issue_ip_rate_limit_per_min": { title: "建会话限流/IP", desc: "每 IP 每分钟可创建公共会话次数。" },
+    "ip_rate_limit_per_min": { title: "聊天限流/IP", desc: "每 IP 每分钟公共聊天请求次数。" },
+    "session_rate_limit_per_min": { title: "聊天限流/会话", desc: "每公共会话每分钟聊天请求次数。" },
+    "max_messages": { title: "最大消息数", desc: "单次公共聊天请求允许的最大 messages 数量。" },
+    "max_input_chars": { title: "输入字符上限", desc: "输入内容近似字符上限。" },
+    "max_input_tokens": { title: "输入 Token 上限", desc: "按约 4 字符≈1 token 的近似上限。" },
+    "allowed_models": { title: "模型白名单", desc: "公共聊天允许的模型列表（仅文本模型）。" },
+    "captcha_enabled": { title: "启用验证码", desc: "启用后创建公共会话时要求 captcha_token。默认关闭。" },
+    "captcha_secret": { title: "验证码密钥", desc: "验证码服务端密钥（例如 Turnstile secret）。" },
+    "captcha_verify_url": { title: "验证码校验地址", desc: "验证码服务端校验接口地址。" }
   }
 };
 

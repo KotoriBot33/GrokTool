@@ -36,8 +36,8 @@
       <div class="grid grid-cols-12 gap-3 items-end">
         <div class="col-span-12 md:col-span-5">
           <label class="field-label">API Key（Bearer）</label>
-          <input id="api-key-input" type="password" class="geist-input font-mono" placeholder="sk-... 或你自定义的 Key" />
-          <div class="text-xs text-[var(--accents-5)] mt-1">保存在浏览器本地，仅用于调用本服务 /v1/*。</div>
+          <input id="api-key-input" type="password" class="geist-input font-mono" placeholder="可选：填写后使用你的 /v1 API Key（高级模式）" />
+          <div id="public-mode-hint" class="text-xs text-[var(--accents-5)] mt-1">当前为公共模式：无需真实 API Key，后端将通过短时 HttpOnly 会话调用。</div>
         </div>
         <div class="col-span-12 md:col-span-4">
           <label class="field-label">模型</label>

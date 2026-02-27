@@ -32,6 +32,7 @@ from app.api.v1.files import router as files_router
 from app.api.v1.models import router as models_router
 from app.api.v1.response import router as responses_router
 from app.api.v1.uploads import router as uploads_router
+from app.api.v1.public import router as public_router
 from app.services.token import get_scheduler
 
 
@@ -135,6 +136,7 @@ def create_app() -> FastAPI:
     app.include_router(responses_router, prefix="/v1", dependencies=[Depends(verify_api_key)])
     app.include_router(uploads_router, prefix="/v1", dependencies=[Depends(verify_api_key)])
     app.include_router(files_router, prefix="/v1/files")
+    app.include_router(public_router, prefix="/api/v1/public")
 
     # 静态文件服务
     #

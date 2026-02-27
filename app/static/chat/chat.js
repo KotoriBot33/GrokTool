@@ -20,6 +20,8 @@ const PREFERRED_CHAT_MODEL = 'grok-4.20-beta';
 let chatSending = false;
 let lastNsfwFlowError = '';
 let nsfwFlowRepairRunning = false;
+let publicSessionReady = false;
+let publicModelCatalog = [];
 
 const NSFW_FLOW_PATTERNS = [
   /nsfw/i,
@@ -48,6 +50,57 @@ function getUserApiKey() {
 function buildApiHeaders() {
   const k = getUserApiKey();
   return k ? { Authorization: `Bearer ${k}` } : {};
+}
+
+function usePublicChannel() {
+  return !isAdminChat() && currentTab === 'chat' && !getUserApiKey();
+}
+
+function togglePublicModeHint(show) {
+  const el = q('public-mode-hint');
+  if (!el) return;
+  el.classList.toggle('hidden', !show);
+}
+
+function buildChatApiRequest() {
+  if (usePublicChannel()) {
+    return {
+      url: '/api/v1/public/chat/completions',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      requiresKey: false,
+      isPublic: true,
+    };
+  }
+
+  return {
+    url: '/v1/chat/completions',
+    headers: { ...buildApiHeaders(), 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
+    requiresKey: true,
+    isPublic: false,
+  };
+}
+
+async function ensurePublicSession() {
+  if (!usePublicChannel()) return true;
+  if (publicSessionReady) return true;
+
+  const res = await fetch('/api/v1/public/session', {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({}),
+  });
+  const payload = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = extractErrorText(payload) || `HTTP ${res.status}`;
+    throw new Error(err);
+  }
+
+  publicSessionReady = true;
+  publicModelCatalog = Array.isArray(payload?.models) ? payload.models : [];
+  return true;
 }
 
 function escapeHtml(s) {
@@ -433,6 +486,7 @@ async function init() {
 
   const saved = localStorage.getItem(STORAGE_KEY) || '';
   if (!q('api-key-input').value) q('api-key-input').value = saved;
+  togglePublicModeHint(usePublicChannel());
 
   bindFileInputs();
   q('image-run-mode')?.addEventListener('change', () => {
@@ -996,22 +1050,45 @@ async function refreshModels() {
   const previousValue = String(sel.value || '').trim();
   sel.innerHTML = '';
 
-  const headers = buildApiHeaders();
-  if (!headers.Authorization) {
-    showToast('请先填写 API Key', 'warning');
-    return;
+  const isPublic = usePublicChannel();
+  togglePublicModeHint(isPublic);
+
+  if (isPublic) {
+    try {
+      await ensurePublicSession();
+      models = publicModelCatalog
+        .map((m) => ({
+          id: String(m?.id || '').trim(),
+          display_name: String(m?.display_name || m?.id || '').trim(),
+        }))
+        .filter((m) => m.id);
+    } catch (e) {
+      showToast('初始化公共会话失败: ' + (e?.message || e), 'error');
+      return;
+    }
+  } else {
+    const headers = buildApiHeaders();
+    if (!headers.Authorization) {
+      showToast('请先填写 API Key', 'warning');
+      return;
+    }
+
+    try {
+      const res = await fetch('/v1/models', { headers });
+      if (res.status === 401) {
+        showToast('API Key 无效或未授权', 'error');
+        return;
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      models = Array.isArray(data?.data) ? data.data : [];
+    } catch (e) {
+      showToast('加载模型失败: ' + (e?.message || e), 'error');
+      return;
+    }
   }
 
   try {
-    const res = await fetch('/v1/models', { headers });
-    if (res.status === 401) {
-      showToast('API Key 无效或未授权', 'error');
-      return;
-    }
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    models = Array.isArray(data?.data) ? data.data : [];
-
     const filtered = models.filter((m) => {
       const id = String(m.id || '');
       if (currentTab === 'image') return id === 'grok-imagine-1.0';
@@ -1055,6 +1132,9 @@ function saveApiKey() {
   if (!k) return showToast('请输入 API Key', 'warning');
   stopImageContinuous();
   localStorage.setItem(STORAGE_KEY, k);
+  publicSessionReady = false;
+  publicModelCatalog = [];
+  togglePublicModeHint(usePublicChannel());
   showToast('已保存', 'success');
   refreshModels();
   refreshImageGenerationMethod();
@@ -1064,6 +1144,9 @@ function clearApiKey() {
   stopImageContinuous();
   localStorage.removeItem(STORAGE_KEY);
   q('api-key-input').value = '';
+  publicSessionReady = false;
+  publicModelCatalog = [];
+  togglePublicModeHint(usePublicChannel());
   imageGenerationMethod = 'legacy';
   imageGenerationExperimental = false;
   updateImageModeUI();
@@ -1075,6 +1158,7 @@ function switchTab(tab) {
     stopImageContinuous();
   }
   currentTab = tab;
+  togglePublicModeHint(usePublicChannel());
   ['chat', 'image', 'video'].forEach((t) => {
     q(`tab-${t}`).classList.toggle('active', t === tab);
     q(`panel-${t}`).classList.toggle('hidden', t !== tab);
@@ -1119,8 +1203,15 @@ async function retryLastAssistantAnswer() {
   if (!model) return showToast('当前没有可用聊天模型', 'error');
 
   const stream = Boolean(q('stream-toggle').checked);
-  const headers = { ...buildApiHeaders(), 'Content-Type': 'application/json' };
-  if (!headers.Authorization) return showToast('请先填写 API Key', 'warning');
+  const req = buildChatApiRequest();
+  if (req.requiresKey && !req.headers.Authorization) return showToast('请先填写 API Key', 'warning');
+  if (req.isPublic) {
+    try {
+      await ensurePublicSession();
+    } catch (e) {
+      return showToast('公共会话不可用: ' + (e?.message || e), 'error');
+    }
+  }
 
   const assistantBubble = showUserMsg('assistant', '');
   setChatSendingState(true);
@@ -1130,9 +1221,18 @@ async function retryLastAssistantAnswer() {
       const content = await streamChat(body, assistantBubble, false);
       chatMessages = [...retryMessages, { role: 'assistant', content }];
     } else {
-      const res = await fetch('/v1/chat/completions', { method: 'POST', headers, body: JSON.stringify(body) });
+      const res = await fetch(req.url, {
+        method: 'POST',
+        headers: req.headers,
+        credentials: req.credentials,
+        body: JSON.stringify(body),
+      });
       const data = await res.json().catch(() => ({}));
-      if (res.status === 401) throw new Error('API Key 无效或未授权');
+      if (res.status === 401 && !req.isPublic) throw new Error('API Key 无效或未授权');
+      if (res.status === 401 && req.isPublic) {
+        publicSessionReady = false;
+        throw new Error('公共会话已过期，请重试');
+      }
       if (!res.ok) {
         const errMsg = extractErrorText(data) || `HTTP ${res.status}`;
         if (isLikelyNsfwFlowError(errMsg)) showNsfwFlowHint(errMsg);
@@ -1160,11 +1260,22 @@ async function sendChat() {
   if (!model) return showToast('当前没有可用聊天模型', 'error');
   const stream = Boolean(q('stream-toggle').checked);
 
-  const headers = { ...buildApiHeaders(), 'Content-Type': 'application/json' };
-  if (!headers.Authorization) return showToast('请先填写 API Key', 'warning');
+  const req = buildChatApiRequest();
+  if (req.requiresKey && !req.headers.Authorization) return showToast('请先填写 API Key', 'warning');
+  if (req.isPublic) {
+    try {
+      await ensurePublicSession();
+    } catch (e) {
+      return showToast('公共会话不可用: ' + (e?.message || e), 'error');
+    }
+  }
 
   setChatSendingState(true);
   try {
+    if (req.isPublic && chatAttachments.length) {
+      throw new Error('公共模式暂不支持图片上传，请先填写 API Key 后再使用图片输入。');
+    }
+
     let imgUrls = [];
     if (chatAttachments.length) {
       showToast('上传图片中...', 'info');
@@ -1192,9 +1303,18 @@ async function sendChat() {
       await streamChat(body, assistantBubble);
       attachAssistantRetryAction(assistantBubble);
     } else {
-      const res = await fetch('/v1/chat/completions', { method: 'POST', headers, body: JSON.stringify(body) });
+      const res = await fetch(req.url, {
+        method: 'POST',
+        headers: req.headers,
+        credentials: req.credentials,
+        body: JSON.stringify(body),
+      });
       const data = await res.json().catch(() => ({}));
-      if (res.status === 401) throw new Error('API Key 无效或未授权');
+      if (res.status === 401 && !req.isPublic) throw new Error('API Key 无效或未授权');
+      if (res.status === 401 && req.isPublic) {
+        publicSessionReady = false;
+        throw new Error('公共会话已过期，请重试');
+      }
       if (!res.ok) {
         const errMsg = extractErrorText(data) || `HTTP ${res.status}`;
         if (isLikelyNsfwFlowError(errMsg)) showNsfwFlowHint(errMsg);
@@ -1213,8 +1333,23 @@ async function sendChat() {
 }
 
 async function streamChat(body, bubbleEl, commitHistory = true) {
-  const headers = { ...buildApiHeaders(), 'Content-Type': 'application/json' };
-  const res = await fetch('/v1/chat/completions', { method: 'POST', headers, body: JSON.stringify(body) });
+  const req = buildChatApiRequest();
+  if (req.requiresKey && !req.headers.Authorization) {
+    throw new Error('请先填写 API Key');
+  }
+  if (req.isPublic) {
+    await ensurePublicSession();
+  }
+
+  const res = await fetch(req.url, {
+    method: 'POST',
+    headers: req.headers,
+    credentials: req.credentials,
+    body: JSON.stringify(body),
+  });
+  if (res.status === 401 && req.isPublic) {
+    publicSessionReady = false;
+  }
   if (!res.ok || !res.body) {
     let errText = '';
     let payload = null;
@@ -1540,8 +1675,19 @@ async function generateVideo() {
 }
 
 async function streamVideo(body, bubbleEl) {
-  const headers = { ...buildApiHeaders(), 'Content-Type': 'application/json' };
-  const res = await fetch('/v1/chat/completions', { method: 'POST', headers, body: JSON.stringify(body) });
+  const req = buildChatApiRequest();
+  if (req.requiresKey && !req.headers.Authorization) {
+    throw new Error('请先填写 API Key');
+  }
+  const res = await fetch(req.url, {
+    method: 'POST',
+    headers: req.headers,
+    credentials: req.credentials,
+    body: JSON.stringify(body),
+  });
+  if (res.status === 401 && req.isPublic) {
+    publicSessionReady = false;
+  }
   if (!res.ok || !res.body) {
     let errText = '';
     let payload = null;

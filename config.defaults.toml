@@ -57,3 +57,27 @@ auto_start_solver = true
 solver_debug = false
 max_errors = 0
 max_runtime_minutes = 0
+
+[public]
+# Scheme A public playground channel (server-side tokens only, no frontend real API keys).
+enabled = true
+cookie_name = "grok2api_public_session"
+session_ttl_seconds = 1800
+# Optional override; defaults to app.app_key (or runtime random secret if absent).
+hmac_secret = ""
+
+# Basic guardrails
+session_issue_ip_rate_limit_per_min = 10
+ip_rate_limit_per_min = 60
+session_rate_limit_per_min = 30
+max_messages = 24
+max_input_chars = 12000
+max_input_tokens = 3000
+
+# Chat-only allowlist for public channel.
+allowed_models = ["grok-4.20-beta", "grok-4", "grok-4-mini", "grok-3-mini", "grok-3"]
+
+# Optional captcha gate (off by default)
+captcha_enabled = false
+captcha_secret = ""
+captcha_verify_url = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
