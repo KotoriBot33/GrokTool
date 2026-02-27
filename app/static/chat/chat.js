@@ -351,6 +351,10 @@ function bindFileInputs() {
     addAttachments('video', files);
     q('video-file').value = '';
   });
+
+  q('video-stitch-toggle')?.addEventListener('change', () => {
+    renderAttachments('video');
+  });
 }
 
 function addAttachments(kind, files) {
@@ -367,7 +371,14 @@ function renderAttachments(kind) {
   const list = kind === 'video' ? videoAttachments : chatAttachments;
   const info = kind === 'video' ? q('video-attach-info') : q('chat-attach-info');
   const box = kind === 'video' ? q('video-attach-preview') : q('chat-attach-preview');
-  info.textContent = list.length ? `已选择 ${list.length} 张图片` : '';
+  if (kind === 'video' && list.length) {
+    const stitchEnabled = Boolean(q('video-stitch-toggle')?.checked);
+    info.textContent = stitchEnabled
+      ? `已选择 ${list.length} 张图片（拼接模式最多使用 4 张）`
+      : `已选择 ${list.length} 张图片（默认仅使用第 1 张）`;
+  } else {
+    info.textContent = list.length ? `已选择 ${list.length} 张图片` : '';
+  }
   box.innerHTML = '';
   if (!list.length) {
     box.classList.add('hidden');
@@ -385,6 +396,66 @@ function renderAttachments(kind) {
     });
     box.appendChild(div);
   });
+}
+
+function shouldUseVideoStitching() {
+  return Boolean(q('video-stitch-toggle')?.checked);
+}
+
+async function loadImageElementFromFile(file) {
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error('Failed to decode image'));
+      image.src = objectUrl;
+    });
+    return img;
+  } finally {
+    try { URL.revokeObjectURL(objectUrl); } catch (e) {}
+  }
+}
+
+async function createStitchedVideoReferenceFile(attachments) {
+  const files = (attachments || []).map((item) => item?.file).filter(Boolean).slice(0, 4);
+  if (files.length <= 1) return files[0] || null;
+
+  const images = await Promise.all(files.map((f) => loadImageElementFromFile(f)));
+  const tileWidth = 768;
+  const tileHeight = 768;
+  const cols = files.length <= 2 ? files.length : 2;
+  const rows = Math.ceil(files.length / cols);
+  const canvas = document.createElement('canvas');
+  canvas.width = tileWidth * cols;
+  canvas.height = tileHeight * rows;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('Canvas context unavailable');
+
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  images.forEach((img, idx) => {
+    const col = idx % cols;
+    const row = Math.floor(idx / cols);
+    const x = col * tileWidth;
+    const y = row * tileHeight;
+
+    const scale = Math.max(tileWidth / img.width, tileHeight / img.height);
+    const drawWidth = img.width * scale;
+    const drawHeight = img.height * scale;
+    const dx = x + (tileWidth - drawWidth) / 2;
+    const dy = y + (tileHeight - drawHeight) / 2;
+    ctx.drawImage(img, dx, dy, drawWidth, drawHeight);
+  });
+
+  const stitchedBlob = await new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) resolve(blob);
+      else reject(new Error('Failed to create stitched image'));
+    }, 'image/jpeg', 0.92);
+  });
+  return new File([stitchedBlob], 'video-stitch-reference.jpg', { type: 'image/jpeg' });
 }
 
 function getImageRunMode() {
@@ -1283,7 +1354,21 @@ async function generateVideo() {
     let imgUrls = [];
     if (videoAttachments.length) {
       showToast('上传图片中...', 'info');
-      imgUrls = await uploadImages(videoAttachments.slice(0, 1).map((x) => x.file));
+      const enableStitching = shouldUseVideoStitching();
+      if (enableStitching && videoAttachments.length > 1) {
+        try {
+          showToast('拼接参考图处理中...', 'info');
+          const stitchedFile = await createStitchedVideoReferenceFile(videoAttachments);
+          if (stitchedFile) {
+            imgUrls = await uploadImages([stitchedFile]);
+          }
+        } catch (e) {
+          showToast('拼接失败，回退为仅上传第一张参考图', 'warning');
+        }
+      }
+      if (!imgUrls.length) {
+        imgUrls = await uploadImages(videoAttachments.slice(0, 1).map((x) => x.file));
+      }
     }
 
     const userContent = imgUrls.length

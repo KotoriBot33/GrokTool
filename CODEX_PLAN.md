@@ -18,7 +18,7 @@ Safety rule: do not break register flow or Cloudflare one-click deploy files (`R
 3. [x] P4 Image Edit Workbench Alignment
 - Align image edit workspace flow and parameters with current API behavior.
 
-4. [ ] P5 Video Page Enhancement + Stitching
+4. [x] P5 Video Page Enhancement + Stitching
 - Enhance video page UX and implement stitching-related flow alignment.
 
 5. [ ] P6 NSFW Cross-Page Full Flow

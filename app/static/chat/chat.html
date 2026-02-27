@@ -190,6 +190,13 @@
             <div class="flex-1"></div>
             <button class="geist-button text-xs px-4 composer-primary" onclick="generateVideo()">生成视频</button>
           </div>
+          <div class="text-xs text-[var(--accents-5)] flex items-center gap-3 flex-wrap">
+            <label class="flex items-center gap-2 cursor-pointer">
+              <input id="video-stitch-toggle" type="checkbox" class="checkbox" />
+              <span>多图拼接上传（最多 4 张）</span>
+            </label>
+            <span>未启用时仅使用第一张参考图。</span>
+          </div>
           <div id="video-attach-preview" class="attach-preview hidden"></div>
         </div>
 
@@ -199,9 +206,8 @@
   </main>
 
   <script src="/static/common/toast.js"></script>
-  <script src="/static/chat/chat.js?v=5"></script>
+  <script src="/static/chat/chat.js?v=6"></script>
 </body>
 
 </html>
-
 
