@@ -118,11 +118,19 @@ async def _verify_ws_api_key(websocket: WebSocket) -> bool:
     return False
 
 
-async def _collect_imagine_batch(token: str, prompt: str, aspect_ratio: str) -> list[str]:
+def _resolve_imagine_batch_size(raw_value: Any, default: int = 6) -> int:
+    try:
+        value = int(raw_value)
+    except Exception:
+        value = default
+    return max(1, min(6, value))
+
+
+async def _collect_imagine_batch(token: str, prompt: str, aspect_ratio: str, batch_size: int = 6) -> list[str]:
     return await collect_experimental_generation_images(
         token=token,
         prompt=prompt,
-        n=6,
+        n=_resolve_imagine_batch_size(batch_size),
         response_format="b64_json",
         aspect_ratio=aspect_ratio,
         concurrency=1,
@@ -160,7 +168,7 @@ async def admin_imagine_ws(websocket: WebSocket):
         run_task = None
         stop_event.clear()
 
-    async def _run(prompt: str, aspect_ratio: str):
+    async def _run(prompt: str, aspect_ratio: str, batch_size: int):
         model_id = "grok-imagine-1.0"
         model_info = ModelService.get(model_id)
         if not model_info or not model_info.is_image:
@@ -182,6 +190,7 @@ async def admin_imagine_ws(websocket: WebSocket):
                 "status": "running",
                 "prompt": prompt,
                 "aspect_ratio": aspect_ratio,
+                "batch_size": batch_size,
                 "run_id": run_id,
             }
         )
@@ -202,7 +211,7 @@ async def admin_imagine_ws(websocket: WebSocket):
                     continue
 
                 start_at = time.time()
-                images = await _collect_imagine_batch(token, prompt, aspect_ratio)
+                images = await _collect_imagine_batch(token, prompt, aspect_ratio, batch_size)
                 elapsed_ms = int((time.time() - start_at) * 1000)
 
                 sent_any = False
@@ -219,6 +228,7 @@ async def admin_imagine_ws(websocket: WebSocket):
                             "created_at": int(time.time() * 1000),
                             "elapsed_ms": elapsed_ms,
                             "aspect_ratio": aspect_ratio,
+                            "batch_size": batch_size,
                             "run_id": run_id,
                         }
                     )
@@ -291,8 +301,9 @@ async def admin_imagine_ws(websocket: WebSocket):
                     )
                     continue
                 ratio = resolve_imagine_aspect_ratio(str(payload.get("aspect_ratio") or "2:3").strip())
+                batch_size = _resolve_imagine_batch_size(payload.get("batch_size"), default=6)
                 await _stop_run()
-                run_task = asyncio.create_task(_run(prompt, ratio))
+                run_task = asyncio.create_task(_run(prompt, ratio, batch_size))
             elif msg_type == "stop":
                 await _stop_run()
             elif msg_type == "ping":

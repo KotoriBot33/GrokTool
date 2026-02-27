@@ -100,7 +100,12 @@ def test_imagine_ws_start_stop_message_flow(monkeypatch: pytest.MonkeyPatch):
     async def _fake_get_token_manager():
         return token_mgr
 
-    async def _fake_collect_imagine_batch(_token: str, _prompt: str, _aspect_ratio: str):
+    async def _fake_collect_imagine_batch(
+        _token: str,
+        _prompt: str,
+        _aspect_ratio: str,
+        _batch_size: int = 6,
+    ):
         await asyncio.sleep(0.01)
         return ["ZmFrZV9pbWFnZQ=="]
 
@@ -130,9 +135,11 @@ def test_imagine_ws_start_stop_message_flow(monkeypatch: pytest.MonkeyPatch):
         )
 
     assert running.get("aspect_ratio") == "1:1"
+    assert int(running.get("batch_size") or 0) == 6
     assert isinstance(running.get("run_id"), str) and running.get("run_id")
     assert image.get("b64_json") == "ZmFrZV9pbWFnZQ=="
     assert image.get("aspect_ratio") == "1:1"
+    assert int(image.get("batch_size") or 0) == 6
     assert int(image.get("sequence") or 0) >= 1
     assert pong == {"type": "pong"}
     assert stopped.get("run_id") == running.get("run_id")
@@ -157,7 +164,12 @@ def test_imagine_ws_stop_immediately_remains_healthy(monkeypatch: pytest.MonkeyP
     async def _fake_get_token_manager():
         return token_mgr
 
-    async def _slow_collect_imagine_batch(_token: str, _prompt: str, _aspect_ratio: str):
+    async def _slow_collect_imagine_batch(
+        _token: str,
+        _prompt: str,
+        _aspect_ratio: str,
+        _batch_size: int = 6,
+    ):
         await asyncio.sleep(0.5)
         return ["ZmFrZV9pbWFnZQ=="]
 
@@ -189,3 +201,57 @@ def test_imagine_ws_stop_immediately_remains_healthy(monkeypatch: pytest.MonkeyP
     assert running.get("run_id")
     assert stopped.get("run_id") == running.get("run_id")
     assert pong == {"type": "pong"}
+
+
+def test_imagine_ws_batch_size_clamped(monkeypatch: pytest.MonkeyPatch):
+    client = _build_client(monkeypatch, api_key="valid-key")
+
+    class _DummyTokenManager:
+        async def reload_if_stale(self):
+            return None
+
+        def get_token_for_model(self, _model_id: str):
+            return "token-demo"
+
+        async def sync_usage(self, *_args, **_kwargs):
+            return True
+
+    token_mgr = _DummyTokenManager()
+    seen_batch_sizes = []
+
+    async def _fake_get_token_manager():
+        return token_mgr
+
+    async def _fake_collect_imagine_batch(
+        _token: str,
+        _prompt: str,
+        _aspect_ratio: str,
+        _batch_size: int = 6,
+    ):
+        seen_batch_sizes.append(int(_batch_size))
+        return ["ZmFrZV9pbWFnZQ=="]
+
+    monkeypatch.setattr(admin_api, "get_token_manager", _fake_get_token_manager)
+    monkeypatch.setattr(
+        admin_api.ModelService,
+        "get",
+        lambda model_id: SimpleNamespace(model_id=model_id, is_image=True),
+    )
+    monkeypatch.setattr(admin_api, "_collect_imagine_batch", _fake_collect_imagine_batch)
+
+    with client.websocket_connect("/api/v1/admin/imagine/ws?api_key=valid-key") as ws:
+        ws.send_json({"type": "start", "prompt": "a bird", "aspect_ratio": "1:1", "batch_size": 99})
+        running = _recv_until(
+            ws,
+            lambda m: m.get("type") == "status" and m.get("status") == "running",
+        )
+        _recv_until(ws, lambda m: m.get("type") == "image")
+        ws.send_json({"type": "stop"})
+        _recv_until(
+            ws,
+            lambda m: m.get("type") == "status" and m.get("status") == "stopped",
+            max_messages=120,
+        )
+
+    assert int(running.get("batch_size") or 0) == 6
+    assert seen_batch_sizes and seen_batch_sizes[0] == 6

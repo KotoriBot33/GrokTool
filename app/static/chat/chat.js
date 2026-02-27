@@ -396,6 +396,13 @@ function getImageContinuousConcurrency() {
   return Math.max(1, Math.min(3, Math.floor(Number(q('image-concurrency')?.value || 1) || 1)));
 }
 
+function getImageContinuousBatchSize(concurrency) {
+  const c = Math.max(1, Math.min(3, Number(concurrency) || 1));
+  if (c >= 3) return 2;
+  if (c === 2) return 3;
+  return 6;
+}
+
 function getImageContinuousActiveCount() {
   return imageContinuousSockets.filter((it) => it && it.active && !it.closed).length;
 }
@@ -567,7 +574,7 @@ function parseWsMessage(raw) {
   }
 }
 
-function openImageContinuousSocket(socketIndex, runToken, prompt, aspectRatio, attempt = 0) {
+function openImageContinuousSocket(socketIndex, runToken, prompt, aspectRatio, batchSize, attempt = 0) {
   const wsUrl = buildImagineWsUrl();
   const ws = new WebSocket(wsUrl);
   const socketState = {
@@ -590,7 +597,7 @@ function openImageContinuousSocket(socketIndex, runToken, prompt, aspectRatio, a
       return;
     }
     clearImageContinuousError();
-    ws.send(JSON.stringify({ type: 'start', prompt, aspect_ratio: aspectRatio }));
+    ws.send(JSON.stringify({ type: 'start', prompt, aspect_ratio: aspectRatio, batch_size: batchSize }));
   };
 
   ws.onmessage = (event) => {
@@ -676,7 +683,7 @@ function openImageContinuousSocket(socketIndex, runToken, prompt, aspectRatio, a
         setTimeout(() => {
           if (!imageContinuousRunning || runToken !== imageContinuousRunToken) return;
           if (getImageContinuousOpenCount() >= imageContinuousDesiredConcurrency) return;
-          openImageContinuousSocket(socketIndex, runToken, prompt, aspectRatio, socketState.attempt + 1);
+          openImageContinuousSocket(socketIndex, runToken, prompt, aspectRatio, batchSize, socketState.attempt + 1);
         }, 1200);
       }
 
@@ -736,6 +743,7 @@ function startImageContinuous() {
 
   const aspectRatio = String(q('image-aspect')?.value || '2:3').trim() || '2:3';
   const concurrency = getImageContinuousConcurrency();
+  const batchSize = getImageContinuousBatchSize(concurrency);
   const token = imageContinuousRunToken + 1;
   imageContinuousDesiredConcurrency = concurrency;
 
@@ -751,7 +759,7 @@ function startImageContinuous() {
   updateImageContinuousStats();
 
   for (let i = 0; i < concurrency; i += 1) {
-    openImageContinuousSocket(i, token, prompt, aspectRatio);
+    openImageContinuousSocket(i, token, prompt, aspectRatio, batchSize);
   }
 }
 
@@ -1348,4 +1356,3 @@ if (document.readyState === 'loading') {
 } else {
   init();
 }
-
