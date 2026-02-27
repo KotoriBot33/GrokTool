@@ -24,5 +24,5 @@ Safety rule: do not break register flow or Cloudflare one-click deploy files (`R
 5. [x] P6 NSFW Cross-Page Full Flow
 - Complete NSFW-related end-to-end behavior across admin and user pages.
 
-6. [ ] P7 Regression and Docs
+6. [x] P7 Regression and Docs
 - Run regression checks and update docs/changelog for completed phases.
