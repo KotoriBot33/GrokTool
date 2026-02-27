@@ -15,7 +15,7 @@ Safety rule: do not break register flow or Cloudflare one-click deploy files (`R
 - Keep API compatibility and preserve existing stop/ping/auth behavior.
 - Add/adjust focused tests for WS waterfall behavior.
 
-3. [ ] P4 Image Edit Workbench Alignment
+3. [x] P4 Image Edit Workbench Alignment
 - Align image edit workspace flow and parameters with current API behavior.
 
 4. [ ] P5 Video Page Enhancement + Stitching

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
 import orjson
-from fastapi import APIRouter, Depends, File, Form, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
 
@@ -131,7 +131,11 @@ def validate_generation_request(request: ImageGenerationRequest):
             )
 
 
-def validate_edit_request(request: ImageEditRequest, images: List[UploadFile]):
+def validate_edit_request(
+    request: ImageEditRequest,
+    images: List[UploadFile],
+    image_refs: Optional[List[str]] = None,
+):
     """Validate image edit request parameters."""
     model_id = request.model or "grok-imagine-1.0-edit"
     if model_id != "grok-imagine-1.0-edit":
@@ -181,18 +185,71 @@ def validate_edit_request(request: ImageEditRequest, images: List[UploadFile]):
                 code="invalid_response_format",
             )
 
-    if not images:
+    refs = image_refs or []
+    total_images = len(images) + len(refs)
+    if total_images == 0:
         raise ValidationException(
             message="Image is required",
             param="image",
             code="missing_image",
         )
-    if len(images) > 16:
+    if total_images > 16:
         raise ValidationException(
             message="Too many images. Maximum is 16.",
             param="image",
             code="invalid_image_count",
         )
+
+
+def _parse_image_ref_candidates(raw_value: str) -> List[str]:
+    value = str(raw_value or "").strip()
+    if not value:
+        return []
+    if value.startswith("[") and value.endswith("]"):
+        try:
+            parsed = orjson.loads(value)
+            if isinstance(parsed, list):
+                out = []
+                for item in parsed:
+                    if isinstance(item, str) and item.strip():
+                        out.append(item.strip())
+                if out:
+                    return out
+        except Exception:
+            pass
+    return [value]
+
+
+def _extract_edit_image_refs(form_data: Any, base_url: str) -> List[str]:
+    refs: List[str] = []
+    seen = set()
+
+    for key in ("image", "image[]", "image_url", "image_urls"):
+        values = []
+        try:
+            values = list(form_data.getlist(key))
+        except Exception:
+            raw = form_data.get(key)
+            if raw is not None:
+                values = [raw]
+
+        for raw in values:
+            if isinstance(raw, UploadFile):
+                continue
+            for candidate in _parse_image_ref_candidates(str(raw or "")):
+                value = str(candidate or "").strip()
+                if not value:
+                    continue
+                if value.lower() in {"null", "none", "undefined"}:
+                    continue
+                if value.startswith("/"):
+                    value = f"{base_url.rstrip('/')}{value}"
+                if value in seen:
+                    continue
+                seen.add(value)
+                refs.append(value)
+
+    return refs
 
 
 def resolve_response_format(response_format: Optional[str]) -> str:
@@ -775,6 +832,7 @@ async def create_image(
 
 @router.post("/images/edits")
 async def edit_image(
+    request: Request,
     prompt: str = Form(...),
     image: Optional[List[UploadFile]] = File(None),
     image_alias: Optional[List[UploadFile]] = File(None, alias="image[]"),
@@ -790,7 +848,7 @@ async def edit_image(
     """
     Image Edits API
 
-    同官方 API 格式，仅支持 multipart/form-data 文件上传
+    同官方 API 格式，支持 multipart/form-data 文件与图片引用字段
     """
     try:
         edit_request = ImageEditRequest(
@@ -825,7 +883,9 @@ async def edit_image(
     edit_request.response_format = response_format
     response_field = response_field_name(response_format)
     images = (image or []) + (image_alias or [])
-    validate_edit_request(edit_request, images)
+    form_data = await request.form()
+    image_refs = _extract_edit_image_refs(form_data, base_url=str(request.base_url))
+    validate_edit_request(edit_request, images, image_refs=image_refs)
 
     model_id = edit_request.model or "grok-imagine-1.0-edit"
     n = int(edit_request.n or 1)
@@ -834,7 +894,7 @@ async def edit_image(
 
     max_image_bytes = 50 * 1024 * 1024
     allowed_types = {"image/png", "image/jpeg", "image/webp", "image/jpg"}
-    image_payloads: List[str] = []
+    image_payloads: List[str] = list(image_refs)
 
     for item in images:
         content = await item.read()

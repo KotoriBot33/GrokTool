@@ -64,3 +64,18 @@ def test_validate_edit_request_accepts_new_model():
     req = ImageEditRequest(prompt="edit", model="grok-imagine-1.0-edit", n=1, stream=False)
     file = UploadFile(filename="a.png", file=BytesIO(b"x"))
     validate_edit_request(req, [file])
+
+
+def test_validate_edit_request_accepts_image_refs_without_files():
+    req = ImageEditRequest(prompt="edit", model="grok-imagine-1.0-edit", n=1, stream=False)
+    validate_edit_request(req, [], image_refs=["/v1/files/image/a.png"])
+
+
+def test_validate_edit_request_rejects_too_many_files_and_refs():
+    req = ImageEditRequest(prompt="edit", model="grok-imagine-1.0-edit", n=1, stream=False)
+    files = [UploadFile(filename=f"{idx}.png", file=BytesIO(b"x")) for idx in range(10)]
+
+    with pytest.raises(ValidationException) as exc:
+        validate_edit_request(req, files, image_refs=[f"/v1/files/image/{idx}.png" for idx in range(7)])
+
+    assert exc.value.code == "invalid_image_count"
