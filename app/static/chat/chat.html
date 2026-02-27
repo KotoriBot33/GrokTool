@@ -54,6 +54,18 @@
       </div>
     </div>
 
+    <div id="nsfw-flow-hint" class="card hidden">
+      <div class="flex items-center justify-between gap-3 flex-wrap">
+        <div class="text-sm text-[var(--accents-7)]">检测到账号可能未完成协议/年龄/NSFW 设置。</div>
+        <div class="flex items-center gap-2">
+          <button class="geist-button-outline text-xs px-3" onclick="hideNsfwFlowHint()">忽略</button>
+          <button id="nsfw-flow-repair-btn" class="geist-button text-xs px-3" onclick="runNsfwFlowRepair()">一键修复</button>
+          <button class="geist-button text-xs px-3" onclick="openNsfwRefreshPage()">前往 Token 管理修复</button>
+        </div>
+      </div>
+      <div id="nsfw-flow-detail" class="text-xs text-[var(--accents-5)] mt-2"></div>
+    </div>
+
     <div class="card">
       <div class="tabs">
         <button id="tab-chat" class="tab active" onclick="switchTab('chat')">聊天</button>
@@ -210,4 +222,3 @@
 </body>
 
 </html>
-

@@ -14,6 +14,7 @@ let autoRegisterLastAdded = 0;
 let liveStatsTimer = null;
 let isWorkersRuntime = false;
 let isNsfwRefreshAllRunning = false;
+let nsfwAutoRefreshDone = false;
 
 let displayTokens = [];
 const filterState = {
@@ -238,8 +239,59 @@ async function init() {
   apiKey = await ensureApiKey();
   if (apiKey === null) return;
   setupConfirmDialog();
+  await maybeRunNsfwRefreshFromQuery();
   loadData();
   startLiveStats();
+}
+
+function parseNsfwRefreshQuery() {
+  try {
+    const params = new URLSearchParams(window.location.search || '');
+    const action = String(params.get('nsfw_refresh') || '').trim().toLowerCase();
+    const source = String(params.get('source') || '').trim().toLowerCase();
+    const hint = String(params.get('hint') || '').trim();
+    return {
+      action,
+      source,
+      hint,
+    };
+  } catch (e) {
+    return { action: '', source: '', hint: '' };
+  }
+}
+
+function clearNsfwRefreshQuery() {
+  try {
+    const url = new URL(window.location.href);
+    url.searchParams.delete('nsfw_refresh');
+    url.searchParams.delete('source');
+    url.searchParams.delete('hint');
+    window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`);
+  } catch (e) {
+    // ignore
+  }
+}
+
+async function maybeRunNsfwRefreshFromQuery() {
+  if (nsfwAutoRefreshDone) return;
+  const query = parseNsfwRefreshQuery();
+  if (query.action !== 'all') return;
+
+  if (query.hint) {
+    const safeHint = query.hint.slice(0, 180);
+    showToast(`来自聊天页的提示: ${safeHint}`, 'error');
+  }
+
+  const sourceLabel = query.source === 'admin_chat' ? '后台聊天' : '聊天页';
+  const ok = await confirmAction(
+    `检测到来自${sourceLabel}的账号设置异常提示，是否立即执行一次全量 NSFW 刷新？`,
+    { okText: '立即刷新', cancelText: '稍后处理' }
+  );
+  clearNsfwRefreshQuery();
+  nsfwAutoRefreshDone = true;
+  if (!ok) return;
+
+  await refreshAllNsfw();
 }
 
 function startLiveStats() {

@@ -18,6 +18,20 @@ let imageContinuousRunToken = 0;
 let imageContinuousDesiredConcurrency = 1;
 const PREFERRED_CHAT_MODEL = 'grok-4.20-beta';
 let chatSending = false;
+let lastNsfwFlowError = '';
+let nsfwFlowRepairRunning = false;
+
+const NSFW_FLOW_PATTERNS = [
+  /nsfw/i,
+  /always_show_nsfw_content/i,
+  /birth\s*date/i,
+  /tos/i,
+  /terms\s*of\s*service/i,
+  /age/i,
+  /adult/i,
+  /forbidden/i,
+  /403/i,
+];
 
 function q(id) {
   return document.getElementById(id);
@@ -109,6 +123,107 @@ function showUserMsg(role, content) {
   q('chat-messages').appendChild(wrap);
   q('chat-messages').scrollTop = q('chat-messages').scrollHeight;
   return bubble;
+}
+
+function extractErrorText(payload) {
+  if (!payload) return '';
+  if (typeof payload === 'string') return payload;
+  if (typeof payload?.detail === 'string') return payload.detail;
+  if (typeof payload?.error === 'string') return payload.error;
+  if (typeof payload?.message === 'string') return payload.message;
+  if (typeof payload?.error?.message === 'string') return payload.error.message;
+  return '';
+}
+
+function isLikelyNsfwFlowError(message) {
+  const text = String(message || '').trim();
+  if (!text) return false;
+  return NSFW_FLOW_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function hideNsfwFlowHint() {
+  const wrap = q('nsfw-flow-hint');
+  if (!wrap) return;
+  wrap.classList.add('hidden');
+}
+
+function setNsfwFlowRepairButtonState(running) {
+  const btn = q('nsfw-flow-repair-btn');
+  if (!btn) return;
+  btn.disabled = Boolean(running);
+  btn.textContent = running ? '修复中...' : '一键修复';
+}
+
+function showNsfwFlowHint(message) {
+  const wrap = q('nsfw-flow-hint');
+  const detail = q('nsfw-flow-detail');
+  if (!wrap || !detail) return;
+  const text = String(message || '').trim() || '服务端返回了账号设置相关错误。';
+  lastNsfwFlowError = text;
+  detail.textContent = `最近错误：${text}`;
+  wrap.classList.remove('hidden');
+}
+
+function openNsfwRefreshPage() {
+  const current = window.location.pathname;
+  const from = current.includes('/admin/chat') ? 'admin_chat' : 'chat';
+  const url = new URL('/admin/token', window.location.origin);
+  url.searchParams.set('nsfw_refresh', 'all');
+  url.searchParams.set('source', from);
+  if (lastNsfwFlowError) {
+    url.searchParams.set('hint', lastNsfwFlowError.slice(0, 160));
+  }
+  window.location.href = url.toString();
+}
+
+async function runNsfwFlowRepair() {
+  if (nsfwFlowRepairRunning) {
+    showToast('NSFW 修复任务进行中', 'info');
+    return;
+  }
+
+  if (!isAdminChat() || typeof ensureApiKey !== 'function' || typeof buildAuthHeaders !== 'function') {
+    openNsfwRefreshPage();
+    return;
+  }
+
+  nsfwFlowRepairRunning = true;
+  setNsfwFlowRepairButtonState(true);
+  try {
+    const adminSession = await ensureApiKey();
+    if (!adminSession) throw new Error('未获取到后台登录态');
+
+    showToast('开始执行全量 NSFW 修复...', 'info');
+    const res = await fetch('/api/v1/admin/tokens/nsfw/refresh', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...buildAuthHeaders(adminSession),
+      },
+      body: JSON.stringify({ all: true }),
+    });
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const errMsg = extractErrorText(payload) || `HTTP ${res.status}`;
+      throw new Error(errMsg);
+    }
+
+    const summary = payload?.summary || {};
+    const total = Number(summary.total || 0);
+    const success = Number(summary.success || 0);
+    const failed = Number(summary.failed || 0);
+    const invalidated = Number(summary.invalidated || 0);
+    showToast(
+      `NSFW 修复完成：总计 ${total}，成功 ${success}，失败 ${failed}，失效 ${invalidated}`,
+      failed > 0 ? 'info' : 'success'
+    );
+    if (failed === 0) hideNsfwFlowHint();
+  } catch (e) {
+    showToast('NSFW 修复失败: ' + (e?.message || e), 'error');
+  } finally {
+    nsfwFlowRepairRunning = false;
+    setNsfwFlowRepairButtonState(false);
+  }
 }
 
 function setChatSendingState(sending) {
@@ -1018,7 +1133,11 @@ async function retryLastAssistantAnswer() {
       const res = await fetch('/v1/chat/completions', { method: 'POST', headers, body: JSON.stringify(body) });
       const data = await res.json().catch(() => ({}));
       if (res.status === 401) throw new Error('API Key 无效或未授权');
-      if (!res.ok) throw new Error(data?.error?.message || data?.detail || `HTTP ${res.status}`);
+      if (!res.ok) {
+        const errMsg = extractErrorText(data) || `HTTP ${res.status}`;
+        if (isLikelyNsfwFlowError(errMsg)) showNsfwFlowHint(errMsg);
+        throw new Error(errMsg);
+      }
       const content = String(data?.choices?.[0]?.message?.content || '');
       renderContent(assistantBubble, content, false);
       chatMessages = [...retryMessages, { role: 'assistant', content }];
@@ -1076,7 +1195,11 @@ async function sendChat() {
       const res = await fetch('/v1/chat/completions', { method: 'POST', headers, body: JSON.stringify(body) });
       const data = await res.json().catch(() => ({}));
       if (res.status === 401) throw new Error('API Key 无效或未授权');
-      if (!res.ok) throw new Error(data?.error?.message || data?.detail || `HTTP ${res.status}`);
+      if (!res.ok) {
+        const errMsg = extractErrorText(data) || `HTTP ${res.status}`;
+        if (isLikelyNsfwFlowError(errMsg)) showNsfwFlowHint(errMsg);
+        throw new Error(errMsg);
+      }
       const content = data?.choices?.[0]?.message?.content || '';
       chatMessages.push({ role: 'assistant', content });
       const assistantBubble = showUserMsg('assistant', content);
@@ -1093,8 +1216,18 @@ async function streamChat(body, bubbleEl, commitHistory = true) {
   const headers = { ...buildApiHeaders(), 'Content-Type': 'application/json' };
   const res = await fetch('/v1/chat/completions', { method: 'POST', headers, body: JSON.stringify(body) });
   if (!res.ok || !res.body) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`HTTP ${res.status}: ${t.slice(0, 200)}`);
+    let errText = '';
+    let payload = null;
+    try {
+      payload = await res.json();
+    } catch (e) {}
+    errText = extractErrorText(payload);
+    if (!errText) {
+      const t = await res.text().catch(() => '');
+      errText = `HTTP ${res.status}: ${t.slice(0, 200)}`;
+    }
+    if (isLikelyNsfwFlowError(errText)) showNsfwFlowHint(errText);
+    throw new Error(errText);
   }
 
   const reader = res.body.getReader();
@@ -1387,7 +1520,11 @@ async function generateVideo() {
     } else {
       const res = await fetch('/v1/chat/completions', { method: 'POST', headers, body: JSON.stringify(reqBody) });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data?.error?.message || data?.detail || `HTTP ${res.status}`);
+      if (!res.ok) {
+        const errMsg = extractErrorText(data) || `HTTP ${res.status}`;
+        if (isLikelyNsfwFlowError(errMsg)) showNsfwFlowHint(errMsg);
+        throw new Error(errMsg);
+      }
       const content = data?.choices?.[0]?.message?.content || '';
       renderContent(bubble, content, false);
     }
@@ -1406,8 +1543,18 @@ async function streamVideo(body, bubbleEl) {
   const headers = { ...buildApiHeaders(), 'Content-Type': 'application/json' };
   const res = await fetch('/v1/chat/completions', { method: 'POST', headers, body: JSON.stringify(body) });
   if (!res.ok || !res.body) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`HTTP ${res.status}: ${t.slice(0, 200)}`);
+    let errText = '';
+    let payload = null;
+    try {
+      payload = await res.json();
+    } catch (e) {}
+    errText = extractErrorText(payload);
+    if (!errText) {
+      const t = await res.text().catch(() => '');
+      errText = `HTTP ${res.status}: ${t.slice(0, 200)}`;
+    }
+    if (isLikelyNsfwFlowError(errText)) showNsfwFlowHint(errText);
+    throw new Error(errText);
   }
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
@@ -1441,3 +1588,7 @@ if (document.readyState === 'loading') {
 } else {
   init();
 }
+
+window.hideNsfwFlowHint = hideNsfwFlowHint;
+window.openNsfwRefreshPage = openNsfwRefreshPage;
+window.runNsfwFlowRepair = runNsfwFlowRepair;
