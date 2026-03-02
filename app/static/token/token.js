@@ -1305,21 +1305,7 @@ async function submitImport() {
   setImportUiRunning(true);
 
   try {
-    const serverBeforeRes = await fetch('/api/v1/admin/tokens', {
-      headers: buildAuthHeaders(apiKey)
-    });
-    if (serverBeforeRes.status === 401) {
-      logout();
-      return;
-    }
-    if (!serverBeforeRes.ok) {
-      const payload = await parseJsonSafely(serverBeforeRes);
-      showToast(extractApiErrorMessage(payload, `导入前校验失败: HTTP ${serverBeforeRes.status}`), 'error');
-      await loadData();
-      return;
-    }
-    const serverBefore = await parseJsonSafely(serverBeforeRes) || {};
-    const baselineCount = countTokensFromData(serverBefore);
+    const baselineCount = flatTokens.length;
 
     const existing = new Set(flatTokens.map((ft) => getTokenKey(ft.token)));
     const toImport = [];
@@ -1342,29 +1328,56 @@ async function submitImport() {
       return;
     }
 
-    const workingTokens = flatTokens.slice();
-    toImport.forEach((token) => {
-      workingTokens.push({
-        token,
-        pool,
-        status: 'active',
-        quota: 80,
-        quota_known: true,
-        heavy_quota: -1,
-        heavy_quota_known: false,
-        token_type: poolToType(pool),
-        note: '',
-        use_count: 0,
-        nsfw_enabled: false,
-        _selected: false
+    const payloadByPool = {};
+    flatTokens.forEach((t) => {
+      if (!payloadByPool[t.pool]) payloadByPool[t.pool] = [];
+      payloadByPool[t.pool].push({
+        token: normalizeSsoToken(t.token),
+        status: t.status,
+        quota: t.quota,
+        heavy_quota: t.heavy_quota,
+        note: t.note,
+        fail_count: t.fail_count,
+        use_count: t.use_count || 0,
+        nsfw_enabled: Boolean(t.nsfw_enabled)
       });
     });
 
-    flatTokens = workingTokens.slice();
+    toImport.forEach((token) => {
+      if (!payloadByPool[pool]) payloadByPool[pool] = [];
+      payloadByPool[pool].push({
+        token,
+        status: 'active',
+        quota: 80,
+        heavy_quota: -1,
+        note: '',
+        fail_count: 0,
+        use_count: 0,
+        nsfw_enabled: false
+      });
+    });
+
     const progressText = document.getElementById('import-progress-text');
     if (progressText) progressText.textContent = `${toImport.length} / ${toImport.length}（保存中）`;
 
-    const saved = await syncToServer();
+    const saveRes = await fetch('/api/v1/admin/tokens', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...buildAuthHeaders(apiKey)
+      },
+      body: JSON.stringify(payloadByPool)
+    });
+    const saved = await parseJsonSafely(saveRes);
+    if (saveRes.status === 401) {
+      logout();
+      return;
+    }
+    if (!saveRes.ok) {
+      showToast(extractApiErrorMessage(saved, `导入保存失败: HTTP ${saveRes.status}`), 'error');
+      await loadData();
+      return;
+    }
     if (!saved) {
       showToast('导入保存失败，已回滚到服务端真实数据', 'error');
       await loadData();
