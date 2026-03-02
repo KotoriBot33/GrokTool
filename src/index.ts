@@ -111,17 +111,15 @@ app.get("/login", (c) => {
 app.get("/manage", (c) => {
   const buildSha = getBuildSha(c.env as Env);
   const v = c.req.query("v") ?? "";
-  if (v !== buildSha) return c.redirect(`/admin/token?v=${encodeURIComponent(buildSha)}`, 302);
-  return c.redirect(`/admin/token?v=${encodeURIComponent(buildSha)}`, 302);
+  if (v !== buildSha) return c.redirect(`/admin/register?v=${encodeURIComponent(buildSha)}`, 302);
+  return c.redirect(`/admin/register?v=${encodeURIComponent(buildSha)}`, 302);
 });
 
 app.get("/admin", (c) => c.redirect("/login", 302));
 
 app.get("/admin/token", (c) => {
   const buildSha = getBuildSha(c.env as Env);
-  const v = c.req.query("v") ?? "";
-  if (v !== buildSha) return c.redirect(`/admin/token?v=${encodeURIComponent(buildSha)}`, 302);
-  return fetchAsset(c, "/token/token.html");
+  return c.redirect(`/admin/register?v=${encodeURIComponent(buildSha)}`, 302);
 });
 
 app.get("/admin/register", (c) => {

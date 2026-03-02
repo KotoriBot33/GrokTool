@@ -90,6 +90,7 @@ function normalizeTokenRecord(pool, raw) {
     note: source.note || '',
     fail_count: source.fail_count || 0,
     use_count: source.use_count || 0,
+    nsfw_enabled: Boolean(source.nsfw_enabled),
     pool: pool,
     _selected: false,
   };
@@ -509,6 +510,13 @@ function renderTable() {
     tdQuota.className = 'text-center font-mono text-xs';
     tdQuota.innerText = item.quota_known ? String(item.quota) : '-';
 
+    // NSFW (Center)
+    const tdNsfw = document.createElement('td');
+    tdNsfw.className = 'text-center';
+    tdNsfw.innerHTML = item.nsfw_enabled
+      ? '<span class="badge badge-green">ON</span>'
+      : '<span class="badge badge-gray">OFF</span>';
+
     // Note (Left)
     const tdNote = document.createElement('td');
     tdNote.className = 'text-left text-gray-500 text-xs truncate max-w-[150px]';
@@ -536,6 +544,7 @@ function renderTable() {
     tr.appendChild(tdType);
     tr.appendChild(tdStatus);
     tr.appendChild(tdQuota);
+    tr.appendChild(tdNsfw);
     tr.appendChild(tdNote);
     tr.appendChild(tdActions);
 
@@ -690,6 +699,7 @@ async function submitManualAdd() {
     note: note,
     status: 'active',
     use_count: 0,
+    nsfw_enabled: false,
     _selected: false
   });
 
@@ -1007,6 +1017,7 @@ async function saveEdit() {
       note: newNote,
       status: 'active', // default
       use_count: 0,
+      nsfw_enabled: false,
       _selected: false
     });
   }
@@ -1043,7 +1054,8 @@ async function syncToServer() {
       heavy_quota: t.heavy_quota,
       note: t.note,
       fail_count: t.fail_count,
-      use_count: t.use_count || 0
+      use_count: t.use_count || 0,
+      nsfw_enabled: Boolean(t.nsfw_enabled)
     });
   });
 
@@ -1113,6 +1125,7 @@ async function submitImport() {
         token_type: poolToType(pool),
         note: '',
         use_count: 0,
+        nsfw_enabled: false,
         _selected: false
       });
     }

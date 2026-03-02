@@ -220,6 +220,42 @@ function poolToTokenType(pool: string): "sso" | "ssoSuper" | null {
   return null;
 }
 
+function parseNsfwEnabled(tagsJson: string): boolean {
+  try {
+    const tags = JSON.parse(tagsJson) as unknown;
+    if (!Array.isArray(tags)) return false;
+    return tags.some((tag) => {
+      const t = String(tag ?? "").trim().toLowerCase();
+      return t === "nsfw" || t === "nsfw_on" || t === "always_show_nsfw_content";
+    });
+  } catch {
+    return false;
+  }
+}
+
+function mergeNsfwTag(tagsJson: string, enabled: boolean): string {
+  let tags: string[] = [];
+  try {
+    const parsed = JSON.parse(tagsJson) as unknown;
+    if (Array.isArray(parsed)) {
+      tags = parsed.map((x) => String(x ?? "").trim()).filter(Boolean);
+    }
+  } catch {
+    tags = [];
+  }
+
+  const normalized = tags.map((x) => x.toLowerCase());
+  const hasNsfw = normalized.includes("nsfw");
+  if (enabled && !hasNsfw) {
+    tags.push("nsfw");
+  }
+  if (!enabled) {
+    tags = tags.filter((x) => x.trim().toLowerCase() !== "nsfw");
+  }
+
+  return JSON.stringify(tags);
+}
+
 async function getKvStats(db: Env["DB"]): Promise<{
   image: { count: number; size_bytes: number; size_mb: number };
   video: { count: number; size_bytes: number; size_mb: number };
@@ -715,6 +751,7 @@ adminRoutes.get("/api/v1/admin/tokens", requireAdminAuth, async (c) => {
         note: r.note ?? "",
         fail_count: r.failed_count ?? 0,
         use_count: 0,
+        nsfw_enabled: parseNsfwEnabled(r.tags ?? "[]"),
       });
     }
     return c.json(out);
@@ -768,10 +805,21 @@ adminRoutes.post("/api/v1/admin/tokens", requireAdminAuth, async (c) => {
         const remaining = quota >= 0 ? quota : -1;
         const heavy = tokenType === "ssoSuper" ? heavyQuota : -1;
 
+        const existingTagsRow = await dbFirst<{ tags: string }>(
+          c.env.DB,
+          "SELECT tags FROM tokens WHERE token = ?",
+          [token],
+        );
+        const currentTags = existingTagsRow?.tags ?? "[]";
+        const nsfwRaw = typeof it === "string" ? undefined : (it as any)?.nsfw_enabled;
+        const nsfwEnabled =
+          typeof nsfwRaw === "boolean" ? nsfwRaw : parseNsfwEnabled(currentTags);
+        const nextTags = mergeNsfwTag(currentTags, nsfwEnabled);
+
         stmts.push(
           c.env.DB.prepare(
-            "INSERT INTO tokens(token, token_type, created_time, remaining_queries, heavy_remaining_queries, status, failed_count, cooldown_until, last_failure_time, last_failure_reason, tags, note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(token) DO UPDATE SET token_type=excluded.token_type, remaining_queries=excluded.remaining_queries, heavy_remaining_queries=excluded.heavy_remaining_queries, status=excluded.status, cooldown_until=excluded.cooldown_until, note=excluded.note",
-          ).bind(token, tokenType, now, remaining, heavy, status, 0, cooldownUntil, null, null, "[]", note),
+            "INSERT INTO tokens(token, token_type, created_time, remaining_queries, heavy_remaining_queries, status, failed_count, cooldown_until, last_failure_time, last_failure_reason, tags, note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(token) DO UPDATE SET token_type=excluded.token_type, remaining_queries=excluded.remaining_queries, heavy_remaining_queries=excluded.heavy_remaining_queries, status=excluded.status, cooldown_until=excluded.cooldown_until, tags=excluded.tags, note=excluded.note",
+          ).bind(token, tokenType, now, remaining, heavy, status, 0, cooldownUntil, null, null, nextTags, note),
         );
       }
     }
@@ -910,6 +958,13 @@ adminRoutes.post("/api/v1/admin/tokens/nsfw/refresh", requireAdminAuth, async (c
             const remaining = Number((r as any)?.remainingTokens);
             if (Number.isFinite(remaining)) {
               await updateTokenLimits(c.env.DB, token, { remaining_queries: Math.max(-1, Math.floor(remaining)) });
+              const tagsRow = await dbFirst<{ tags: string }>(
+                c.env.DB,
+                "SELECT tags FROM tokens WHERE token = ?",
+                [token],
+              );
+              const nextTags = mergeNsfwTag(tagsRow?.tags ?? "[]", true);
+              await dbRun(c.env.DB, "UPDATE tokens SET tags = ? WHERE token = ?", [nextTags, token]);
               success = true;
               break;
             }
@@ -931,6 +986,7 @@ adminRoutes.post("/api/v1/admin/tokens/nsfw/refresh", requireAdminAuth, async (c
 
     const settled = await runTasksSettledWithLimit(targets, concurrency, refreshOne);
     const details: Array<{ token: string; success: boolean; reason?: string }> = [];
+    const successTokens: string[] = [];
     let success = 0;
     let failed = 0;
 
@@ -940,12 +996,30 @@ adminRoutes.post("/api/v1/admin/tokens/nsfw/refresh", requireAdminAuth, async (c
       if (item.status === "fulfilled") {
         const value = item.value;
         details.push({ token: `sso=${value.token}`, success: value.ok, ...(value.reason ? { reason: value.reason } : {}) });
-        if (value.ok) success += 1;
-        else failed += 1;
+        if (value.ok) {
+          success += 1;
+          successTokens.push(value.token);
+        } else {
+          failed += 1;
+        }
       } else {
         const reason = item.reason instanceof Error ? item.reason.message : String(item.reason ?? "refresh_error");
         details.push({ token: `sso=${token}`, success: false, reason });
         failed += 1;
+      }
+    }
+
+    if (successTokens.length) {
+      const placeholders = successTokens.map(() => "?").join(",");
+      const rows = await dbAll<{ token: string; tags: string }>(
+        c.env.DB,
+        `SELECT token, tags FROM tokens WHERE token IN (${placeholders})`,
+        successTokens,
+      );
+      const tagsByToken = new Map(rows.map((r) => [r.token, r.tags]));
+      for (const token of successTokens) {
+        const nextTags = mergeNsfwTag(tagsByToken.get(token) ?? "[]", true);
+        await dbRun(c.env.DB, "UPDATE tokens SET tags = ? WHERE token = ?", [nextTags, token]);
       }
     }
 

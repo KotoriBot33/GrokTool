@@ -428,7 +428,7 @@ class TokenManager:
         return True
 
     async def mark_token_account_settings_success(self, token_str: str, save: bool = True) -> bool:
-        """Reset failure state after account-settings flow succeeded."""
+        """Reset failure state after account-settings flow succeeded and mark NSFW as enabled."""
         token, raw_token = self._find_token_info(token_str)
         if not token:
             logger.warning(f"Token {raw_token[:10]}...: not found for account-settings success")
@@ -439,6 +439,12 @@ class TokenManager:
         token.last_fail_reason = None
         token.last_sync_at = int(datetime.now().timestamp() * 1000)
         token.status = TokenStatus.COOLING if token.quota == 0 else TokenStatus.ACTIVE
+
+        tags = list(getattr(token, "tags", []) or [])
+        normalized = {str(x or "").strip().lower() for x in tags}
+        if "nsfw" not in normalized:
+            tags.append("nsfw")
+            token.tags = tags
 
         if save:
             await self._save()

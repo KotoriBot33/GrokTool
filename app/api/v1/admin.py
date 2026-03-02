@@ -75,7 +75,13 @@ async def admin_config_page():
 
 @router.get("/admin/token", response_class=HTMLResponse, include_in_schema=False)
 async def admin_token_page():
-    """Token 管理页"""
+    """旧 Token 管理入口（已并入 /admin/register）。"""
+    return RedirectResponse(url="/admin/register", status_code=302)
+
+
+@router.get("/admin/register", response_class=HTMLResponse, include_in_schema=False)
+async def admin_register_page():
+    """注册管理页（承载 Token 管理能力）。"""
     return await render_template("token/token.html")
 
 @router.get("/admin/datacenter", response_class=HTMLResponse, include_in_schema=False)
@@ -425,6 +431,30 @@ def _normalize_token_status(raw_status: Any) -> str:
     return "active"
 
 
+def _has_nsfw_tag(tags: Any) -> bool:
+    if not isinstance(tags, list):
+        return False
+    normalized = {str(x or "").strip().lower() for x in tags}
+    return (
+        "nsfw" in normalized
+        or "nsfw_on" in normalized
+        or "always_show_nsfw_content" in normalized
+    )
+
+
+def _set_nsfw_tag(tags: list[str], enabled: bool) -> list[str]:
+    normalized = {str(x or "").strip().lower() for x in tags}
+    out = [str(x or "").strip() for x in tags if str(x or "").strip()]
+
+    if enabled:
+        if "nsfw" not in normalized:
+            out.append("nsfw")
+    else:
+        out = [x for x in out if x.strip().lower() != "nsfw"]
+
+    return out
+
+
 def _normalize_admin_token_item(pool_name: str, item: Any) -> dict | None:
     token_type = _pool_to_token_type(pool_name)
 
@@ -445,6 +475,7 @@ def _normalize_admin_token_item(pool_name: str, item: Any) -> dict | None:
             "note": "",
             "fail_count": 0,
             "use_count": 0,
+            "nsfw_enabled": False,
         }
 
     if not isinstance(item, dict):
@@ -459,6 +490,9 @@ def _normalize_admin_token_item(pool_name: str, item: Any) -> dict | None:
     quota, quota_known = _parse_quota_value(item.get("quota"))
     heavy_quota, heavy_quota_known = _parse_quota_value(item.get("heavy_quota"))
 
+    tags_raw = item.get("tags") if isinstance(item.get("tags"), list) else []
+    nsfw_enabled = bool(item.get("nsfw_enabled")) or _has_nsfw_tag(tags_raw)
+
     return {
         "token": token,
         "status": _normalize_token_status(item.get("status")),
@@ -470,6 +504,7 @@ def _normalize_admin_token_item(pool_name: str, item: Any) -> dict | None:
         "note": str(item.get("note") or ""),
         "fail_count": _safe_int(item.get("fail_count") or 0, 0),
         "use_count": _safe_int(item.get("use_count") or 0, 0),
+        "nsfw_enabled": nsfw_enabled,
     }
 
 
@@ -734,6 +769,40 @@ async def update_tokens_api(data: dict):
             concurrency=concurrency,
             retries=retries,
         )
+
+        try:
+            await mgr.reload()
+            changed_any = False
+            for pool_name, pool in mgr.pools.items():
+                posted_items = posted_data.get(pool_name, []) if isinstance(posted_data.get(pool_name, []), list) else []
+                posted_map: dict[str, dict] = {}
+                for it in posted_items:
+                    if isinstance(it, str):
+                        continue
+                    if not isinstance(it, dict):
+                        continue
+                    raw = normalize_refresh_token(str(it.get("token") or ""))
+                    if raw:
+                        posted_map[raw] = it
+
+                for info in pool.list():
+                    token = normalize_refresh_token(str(getattr(info, "token", "") or ""))
+                    if not token:
+                        continue
+                    item = posted_map.get(token)
+                    if not isinstance(item, dict):
+                        continue
+                    requested_nsfw = bool(item.get("nsfw_enabled"))
+                    tags = list(getattr(info, "tags", []) or [])
+                    next_tags = _set_nsfw_tag(tags, requested_nsfw)
+                    if next_tags != tags:
+                        info.tags = next_tags
+                        changed_any = True
+
+            if changed_any:
+                await mgr.commit()
+        except Exception as e:
+            logger.warning(f"Failed to sync nsfw tag field: {e}")
 
         return {
             "status": "success",
