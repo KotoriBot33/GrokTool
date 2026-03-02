@@ -176,6 +176,46 @@ function findTokenIndexByKey(tokenKey) {
   return flatTokens.findIndex((t) => getTokenKey(t.token) === key);
 }
 
+async function importTokensIncremental({ pool, tokens, quota = 80, note = '' }) {
+  const normalizedTokens = [...new Set((tokens || [])
+    .map((t) => normalizeSsoToken(String(t || '').trim()))
+    .filter(Boolean))];
+  if (!normalizedTokens.length) {
+    return { added: 0, skipped: 0, total: 0 };
+  }
+
+  const payload = {
+    pool: (pool || 'ssoBasic').trim() || 'ssoBasic',
+    tokens: normalizedTokens,
+    quota,
+    note: String(note || '').trim().slice(0, 50)
+  };
+
+  const res = await fetch('/api/v1/admin/tokens/import', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...buildAuthHeaders(apiKey)
+    },
+    body: JSON.stringify(payload)
+  });
+
+  const data = await parseJsonSafely(res);
+  if (res.status === 401) {
+    logout();
+    return null;
+  }
+  if (!res.ok) {
+    throw new Error(extractApiErrorMessage(data, `导入失败: HTTP ${res.status}`));
+  }
+
+  return {
+    added: Number(data?.added || 0),
+    skipped: Number(data?.skipped || 0),
+    total: Number(data?.total || normalizedTokens.length),
+  };
+}
+
 function refreshFilterStateFromDom() {
   const getChecked = (id) => {
     const el = document.getElementById(id);
@@ -853,7 +893,7 @@ async function submitManualAdd() {
   const noteInput = document.getElementById('add-token-note');
 
   if (!tokenInput) return;
-  let token = normalizeSsoToken(tokenInput.value.trim());
+  const token = normalizeSsoToken(tokenInput.value.trim());
   if (!token) return showToast('Token 不能为空', 'error');
 
   if (flatTokens.some(t => getTokenKey(t.token) === token)) {
@@ -865,25 +905,28 @@ async function submitManualAdd() {
   if (!quota || Number.isNaN(quota)) quota = 80;
   const note = noteInput ? noteInput.value.trim().slice(0, 50) : '';
 
-  flatTokens.push({
-    token: token,
-    pool: pool,
-    quota: quota,
-    quota_known: true,
-    heavy_quota: -1,
-    heavy_quota_known: false,
-    token_type: poolToType(pool),
-    note: note,
-    status: 'active',
-    use_count: 0,
-    nsfw_enabled: false,
-    _selected: false
-  });
+  try {
+    const result = await importTokensIncremental({
+      pool,
+      tokens: [token],
+      quota,
+      note,
+    });
+    if (!result) return;
 
-  await syncToServer();
-  closeAddModal();
-  applyFilters();
-  loadData();
+    if (result.added > 0) {
+      showToast('添加成功', 'success');
+      closeAddModal();
+    } else {
+      showToast('Token 已存在（服务端）', 'info');
+    }
+
+    await loadData();
+    applyFilters();
+  } catch (e) {
+    showToast(e?.message ? `添加失败: ${e.message}` : '添加失败', 'error');
+    await loadData();
+  }
 }
 
 function stopAutoRegisterPolling() {
@@ -1305,8 +1348,6 @@ async function submitImport() {
   setImportUiRunning(true);
 
   try {
-    const baselineCount = flatTokens.length;
-
     const existing = new Set(flatTokens.map((ft) => getTokenKey(ft.token)));
     const toImport = [];
     const totalLines = lines.length;
@@ -1328,85 +1369,23 @@ async function submitImport() {
       return;
     }
 
-    const payloadByPool = {};
-    flatTokens.forEach((t) => {
-      if (!payloadByPool[t.pool]) payloadByPool[t.pool] = [];
-      payloadByPool[t.pool].push({
-        token: normalizeSsoToken(t.token),
-        status: t.status,
-        quota: t.quota,
-        heavy_quota: t.heavy_quota,
-        note: t.note,
-        fail_count: t.fail_count,
-        use_count: t.use_count || 0,
-        nsfw_enabled: Boolean(t.nsfw_enabled)
-      });
-    });
-
-    toImport.forEach((token) => {
-      if (!payloadByPool[pool]) payloadByPool[pool] = [];
-      payloadByPool[pool].push({
-        token,
-        status: 'active',
-        quota: 80,
-        heavy_quota: -1,
-        note: '',
-        fail_count: 0,
-        use_count: 0,
-        nsfw_enabled: false
-      });
-    });
-
     const progressText = document.getElementById('import-progress-text');
     if (progressText) progressText.textContent = `${toImport.length} / ${toImport.length}（保存中）`;
 
-    const saveRes = await fetch('/api/v1/admin/tokens', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...buildAuthHeaders(apiKey)
-      },
-      body: JSON.stringify(payloadByPool)
+    const result = await importTokensIncremental({
+      pool,
+      tokens: toImport,
+      quota: 80,
+      note: '',
     });
-    const saved = await parseJsonSafely(saveRes);
-    if (saveRes.status === 401) {
-      logout();
-      return;
-    }
-    if (!saveRes.ok) {
-      showToast(extractApiErrorMessage(saved, `导入保存失败: HTTP ${saveRes.status}`), 'error');
-      await loadData();
-      return;
-    }
-    if (!saved) {
-      showToast('导入保存失败，已回滚到服务端真实数据', 'error');
-      await loadData();
-      return;
-    }
-
-    const serverAfterRes = await fetch('/api/v1/admin/tokens', {
-      headers: buildAuthHeaders(apiKey)
-    });
-    if (serverAfterRes.status === 401) {
-      logout();
-      return;
-    }
-    if (!serverAfterRes.ok) {
-      const payload = await parseJsonSafely(serverAfterRes);
-      showToast(extractApiErrorMessage(payload, `导入后校验失败: HTTP ${serverAfterRes.status}`), 'error');
-      await loadData();
-      return;
-    }
-
-    const serverAfter = await parseJsonSafely(serverAfterRes) || {};
-    const finalCount = countTokensFromData(serverAfter);
-    const serverAdded = Math.max(0, finalCount - baselineCount);
-    const triggeredAdded = Number(saved?.nsfw_refresh?.triggered || 0);
-    const actualAdded = Math.max(serverAdded, triggeredAdded);
+    if (!result) return;
 
     setImportProgress(toImport.length, toImport.length);
-    showToast(`导入完成，服务端实际新增 ${actualAdded} 个 Token`, 'success');
+    showToast(`导入完成，新增 ${result.added} 个，跳过 ${result.skipped} 个`, 'success');
     closeImportModal(true);
+    await loadData();
+  } catch (e) {
+    showToast(e?.message ? `导入失败: ${e.message}` : '导入失败', 'error');
     await loadData();
   } finally {
     isImportRunning = false;

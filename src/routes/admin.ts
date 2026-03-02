@@ -843,6 +843,81 @@ adminRoutes.post("/api/v1/admin/tokens", requireAdminAuth, async (c) => {
   }
 });
 
+adminRoutes.post("/api/v1/admin/tokens/import", requireAdminAuth, async (c) => {
+  try {
+    const body = (await c.req.json()) as {
+      pool?: string;
+      tokens?: unknown;
+      quota?: number;
+      note?: string;
+    };
+
+    const pool = String(body?.pool ?? "").trim();
+    const tokenType = poolToTokenType(pool);
+    if (!tokenType) return c.json(legacyErr("Invalid pool"), 400);
+
+    const rawTokens: string[] = [];
+    if (Array.isArray(body?.tokens)) {
+      for (const t of body.tokens) {
+        if (typeof t === "string") rawTokens.push(t);
+      }
+    } else if (typeof body?.tokens === "string") {
+      rawTokens.push(body.tokens);
+    }
+
+    const normalized = [...new Set(rawTokens.map((t) => normalizeSsoToken(String(t))).filter(Boolean))];
+    if (!normalized.length) return c.json(legacyErr("No tokens provided"), 400);
+
+    const placeholders = normalized.map(() => "?").join(",");
+    const existingRows = placeholders
+      ? await dbAll<{ token: string }>(
+          c.env.DB,
+          `SELECT token FROM tokens WHERE token IN (${placeholders})`,
+          normalized,
+        )
+      : [];
+    const existingSet = new Set(existingRows.map((r) => r.token));
+
+    const quotaRaw = Number(body?.quota);
+    const quota = Number.isFinite(quotaRaw) && quotaRaw >= 0 ? Math.floor(quotaRaw) : 80;
+    const note = String(body?.note ?? "").trim().slice(0, 50);
+
+    const now = nowMs();
+    const stmts: D1PreparedStatement[] = [];
+    let added = 0;
+    let skipped = 0;
+
+    for (const token of normalized) {
+      if (existingSet.has(token)) {
+        skipped += 1;
+        continue;
+      }
+      const heavyQuota = tokenType === "ssoSuper" ? quota : -1;
+      stmts.push(
+        c.env.DB.prepare(
+          "INSERT INTO tokens(token, token_type, created_time, remaining_queries, heavy_remaining_queries, status, failed_count, cooldown_until, last_failure_time, last_failure_reason, tags, note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        ).bind(token, tokenType, now, quota, heavyQuota, "active", 0, null, null, null, "[]", note),
+      );
+      added += 1;
+    }
+
+    if (stmts.length) {
+      await c.env.DB.batch(stmts);
+    }
+
+    return c.json(
+      legacyOk({
+        message: "Token 导入完成",
+        total: normalized.length,
+        added,
+        skipped,
+      }),
+    );
+  } catch (e) {
+    return c.json(legacyErr(`Import tokens failed: ${e instanceof Error ? e.message : String(e)}`), 500);
+  }
+});
+
 adminRoutes.post("/api/v1/admin/tokens/refresh", requireAdminAuth, async (c) => {
   try {
     const body = (await c.req.json()) as any;
