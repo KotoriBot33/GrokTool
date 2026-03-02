@@ -176,9 +176,9 @@ function findTokenIndexByKey(tokenKey) {
   return flatTokens.findIndex((t) => getTokenKey(t.token) === key);
 }
 
-const IMPORT_API_CHUNK_SIZE = 200;
+const IMPORT_API_CHUNK_SIZE = 40;
 
-async function importTokensIncremental({ pool, tokens, quota = 80, note = '' }) {
+async function importTokensIncremental({ pool, tokens, quota = 80, note = '', onChunkDone = null }) {
   const normalizedTokens = [...new Set((tokens || [])
     .map((t) => normalizeSsoToken(String(t || '').trim()))
     .filter(Boolean))];
@@ -200,27 +200,47 @@ async function importTokensIncremental({ pool, tokens, quota = 80, note = '' }) 
       note: String(note || '').trim().slice(0, 50)
     };
 
-    const res = await fetch('/api/v1/admin/tokens/import', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...buildAuthHeaders(apiKey)
-      },
-      body: JSON.stringify(payload)
-    });
+    let res;
+    let data;
+    try {
+      res = await fetch('/api/v1/admin/tokens/import', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...buildAuthHeaders(apiKey)
+        },
+        body: JSON.stringify(payload)
+      });
+      data = await parseJsonSafely(res);
+    } catch (e) {
+      const failedFrom = i + 1;
+      const failedTo = Math.min(i + chunk.length, normalizedTokens.length);
+      throw new Error(`网络错误（分片 ${failedFrom}-${failedTo}）: ${e?.message || '请求失败'}`);
+    }
 
-    const data = await parseJsonSafely(res);
     if (res.status === 401) {
       logout();
       return null;
     }
     if (!res.ok) {
-      throw new Error(extractApiErrorMessage(data, `导入失败: HTTP ${res.status}`));
+      const failedFrom = i + 1;
+      const failedTo = Math.min(i + chunk.length, normalizedTokens.length);
+      const detail = extractApiErrorMessage(data, `HTTP ${res.status}`);
+      throw new Error(`分片 ${failedFrom}-${failedTo} 导入失败: ${detail}`);
     }
 
     added += Number(data?.added || 0);
     skipped += Number(data?.skipped || 0);
     total += Number(data?.total || chunk.length);
+
+    if (typeof onChunkDone === 'function') {
+      onChunkDone({
+        processed: Math.min(i + chunk.length, normalizedTokens.length),
+        total: normalizedTokens.length,
+        added,
+        skipped,
+      });
+    }
   }
 
   return { added, skipped, total };
@@ -1380,13 +1400,19 @@ async function submitImport() {
     }
 
     const progressText = document.getElementById('import-progress-text');
-    if (progressText) progressText.textContent = `${toImport.length} / ${toImport.length}（保存中）`;
+    if (progressText) progressText.textContent = `0 / ${toImport.length}（保存中）`;
 
     const result = await importTokensIncremental({
       pool,
       tokens: toImport,
       quota: 80,
       note: '',
+      onChunkDone: ({ processed, total }) => {
+        setImportProgress(total, processed);
+        if (progressText) {
+          progressText.textContent = `${processed} / ${total}（已写入）`;
+        }
+      },
     });
     if (!result) return;
 
