@@ -10,7 +10,7 @@
   <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-sans/style.css" rel="stylesheet">
   <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-mono/style.css" rel="stylesheet">
   <link href="/static/common/common.css?v=3" rel="stylesheet">
-  <link href="/static/token/token.css?v=12" rel="stylesheet">
+  <link href="/static/token/token.css?v=13" rel="stylesheet">
   <link href="/static/common/toast.css" rel="stylesheet">
 </head>
 
@@ -38,6 +38,14 @@
               <line x1="12" y1="3" x2="12" y2="15"></line>
             </svg>
             导入
+          </button>
+          <button id="btn-refresh-nsfw-page" onclick="refreshCurrentPageNsfw()" class="geist-button-outline gap-2 hidden">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="23 4 23 10 17 10"></polyline>
+              <polyline points="1 20 1 14 7 14"></polyline>
+              <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+            </svg>
+            刷新当前页 NSFW
           </button>
           <button id="btn-refresh-nsfw-all" onclick="refreshAllNsfw()" class="geist-button-outline gap-2 hidden">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -131,6 +139,16 @@
         </div>
       </div>
 
+      <div id="nsfw-page-progress" class="hidden mb-4 bg-white border border-[var(--border)] rounded-lg px-4 py-3">
+        <div class="flex items-center justify-between gap-3 text-xs text-[var(--accents-5)]">
+          <span id="nsfw-page-progress-label">当前页 NSFW 刷新进度</span>
+          <span id="nsfw-page-progress-text">0 / 0</span>
+        </div>
+        <div class="nsfw-progress-track mt-2">
+          <div id="nsfw-page-progress-bar" class="nsfw-progress-bar" style="width: 0%;"></div>
+        </div>
+      </div>
+
       <!-- Token Table -->
       <div class="rounded-lg overflow-hidden bg-white mb-4 overflow-x-auto">
         <table class="geist-table min-w-[800px]">
@@ -153,6 +171,29 @@
         <div id="loading" class="text-center py-12 text-[var(--accents-4)]">加载中...</div>
         <div id="empty-state" class="hidden text-center py-12 text-[var(--accents-4)]">
           暂无 Token，请点击右上角导入或添加。
+        </div>
+      </div>
+
+      <div id="pagination-bar"
+        class="pagination-bar mb-2 bg-white border border-[var(--border)] rounded-lg px-4 py-3 flex flex-wrap items-center gap-3">
+        <div class="flex items-center gap-2 text-xs text-[var(--accents-5)] whitespace-nowrap">
+          <span>每页</span>
+          <select id="page-size-select" class="geist-input h-8 text-xs px-2" onchange="onPageSizeChange(this.value)">
+            <option value="10">10</option>
+            <option value="20" selected>20</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+            <option value="200">200</option>
+            <option value="500">500</option>
+            <option value="1000">1000</option>
+            <option value="all">全部</option>
+          </select>
+        </div>
+        <div class="text-xs text-[var(--accents-5)] whitespace-nowrap" id="page-info">第 1 / 1 页</div>
+        <div class="text-xs text-[var(--accents-5)] whitespace-nowrap ml-auto" id="page-range-info">显示 0 - 0 / 0</div>
+        <div class="flex items-center gap-2">
+          <button id="btn-page-prev" onclick="goToPrevPage()" class="geist-button-outline text-xs px-3 h-8">上一页</button>
+          <button id="btn-page-next" onclick="goToNextPage()" class="geist-button-outline text-xs px-3 h-8">下一页</button>
         </div>
       </div>
 
@@ -363,7 +404,7 @@
   <script src="/static/common/header.js?v=4"></script>
   <script src="/static/common/footer.js?v=1"></script>
   <script src="/static/common/toast.js"></script>
-  <script src="/static/token/token.js?v=15"></script>
+  <script src="/static/token/token.js?v=16"></script>
 </body>
 
 </html>

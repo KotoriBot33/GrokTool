@@ -198,6 +198,53 @@
       align-items: flex-start;
     }
 
+    .token-cell-wrap {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+    }
+
+    .token-cell-text,
+    .note-cell-text {
+      display: -webkit-box;
+      -webkit-box-orient: vertical;
+      -webkit-line-clamp: 2;
+      overflow: hidden;
+      word-break: break-all;
+      line-height: 1.35;
+      max-height: 2.7em;
+    }
+
+    .token-cell-text {
+      font-family: 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+      font-size: 11px;
+      color: #6b7280;
+      flex: 1;
+      min-width: 0;
+    }
+
+    .note-cell-text {
+      font-size: 12px;
+      color: #6b7280;
+      word-break: break-word;
+    }
+
+    .nsfw-progress-track {
+      width: 100%;
+      height: 8px;
+      border-radius: 9999px;
+      background: #f3f4f6;
+      overflow: hidden;
+      border: 1px solid #e5e7eb;
+    }
+
+    .nsfw-progress-bar {
+      height: 100%;
+      border-radius: 9999px;
+      background: linear-gradient(90deg, #111827 0%, #374151 100%);
+      transition: width 0.2s ease;
+    }
+
     #batch-actions {
       background: rgba(255, 255, 255, 0.92);
       border: 1px solid var(--border);

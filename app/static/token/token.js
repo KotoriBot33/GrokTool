@@ -14,9 +14,14 @@ let autoRegisterLastAdded = 0;
 let liveStatsTimer = null;
 let isWorkersRuntime = false;
 let isNsfwRefreshAllRunning = false;
+let isNsfwRefreshPageRunning = false;
 let nsfwAutoRefreshDone = false;
 
 let displayTokens = [];
+let currentPage = 1;
+let pageSize = '20';
+const PAGE_SIZE_VALUES = ['10', '20', '50', '100', '200', '500', '1000', 'all'];
+const NSFW_PAGE_BATCH_SIZE = 20;
 const filterState = {
   typeSso: false,
   typeSuperSso: false,
@@ -163,8 +168,112 @@ function applyFilters() {
   }
 }
 
+function normalizePageSize(raw) {
+  const text = String(raw || '').trim().toLowerCase();
+  if (text === 'all') return 'all';
+  const n = Number(text);
+  const normalized = Number.isFinite(n) ? String(Math.floor(n)) : '';
+  return PAGE_SIZE_VALUES.includes(normalized) ? normalized : '20';
+}
+
+function getResolvedPageSize() {
+  if (pageSize === 'all') {
+    return Math.max(1, displayTokens.length || 1);
+  }
+  const n = Number(pageSize);
+  if (!Number.isFinite(n) || n <= 0) return 20;
+  return Math.floor(n);
+}
+
+function getTotalPages() {
+  if (displayTokens.length === 0) return 1;
+  if (pageSize === 'all') return 1;
+  const size = getResolvedPageSize();
+  return Math.max(1, Math.ceil(displayTokens.length / size));
+}
+
+function ensureCurrentPageInRange() {
+  const totalPages = getTotalPages();
+  if (currentPage < 1) currentPage = 1;
+  if (currentPage > totalPages) currentPage = totalPages;
+}
+
+function getCurrentPageTokens() {
+  ensureCurrentPageInRange();
+  if (displayTokens.length === 0) return [];
+  if (pageSize === 'all') return displayTokens.slice();
+  const size = getResolvedPageSize();
+  const start = (currentPage - 1) * size;
+  return displayTokens.slice(start, start + size);
+}
+
+function updatePaginationUi() {
+  const pageInfo = document.getElementById('page-info');
+  const pageRangeInfo = document.getElementById('page-range-info');
+  const prevBtn = document.getElementById('btn-page-prev');
+  const nextBtn = document.getElementById('btn-page-next');
+  const pageSizeSelect = document.getElementById('page-size-select');
+
+  ensureCurrentPageInRange();
+  const total = displayTokens.length;
+  const totalPages = getTotalPages();
+  const size = getResolvedPageSize();
+  const start = total === 0 ? 0 : (pageSize === 'all' ? 1 : ((currentPage - 1) * size + 1));
+  const end = total === 0 ? 0 : (pageSize === 'all' ? total : Math.min(currentPage * size, total));
+
+  if (pageInfo) pageInfo.textContent = `第 ${currentPage} / ${totalPages} 页`;
+  if (pageRangeInfo) pageRangeInfo.textContent = `显示 ${start} - ${end} / ${total}`;
+  if (prevBtn) prevBtn.disabled = total === 0 || currentPage <= 1;
+  if (nextBtn) nextBtn.disabled = total === 0 || currentPage >= totalPages;
+  if (pageSizeSelect && pageSizeSelect.value !== pageSize) {
+    pageSizeSelect.value = pageSize;
+  }
+}
+
+function onPageSizeChange(value) {
+  pageSize = normalizePageSize(value);
+  currentPage = 1;
+  renderTable();
+}
+
+function goToPrevPage() {
+  ensureCurrentPageInRange();
+  if (currentPage <= 1) return;
+  currentPage -= 1;
+  renderTable();
+}
+
+function goToNextPage() {
+  const totalPages = getTotalPages();
+  ensureCurrentPageInRange();
+  if (currentPage >= totalPages) return;
+  currentPage += 1;
+  renderTable();
+}
+
+function setNsfwPageProgress(total, processed) {
+  const panel = document.getElementById('nsfw-page-progress');
+  const text = document.getElementById('nsfw-page-progress-text');
+  const bar = document.getElementById('nsfw-page-progress-bar');
+  if (!panel || !text || !bar) return;
+
+  const safeTotal = Math.max(0, Number(total) || 0);
+  const safeProcessed = Math.max(0, Math.min(safeTotal, Number(processed) || 0));
+  const pct = safeTotal > 0 ? Math.floor((safeProcessed / safeTotal) * 100) : 0;
+
+  panel.classList.remove('hidden');
+  text.textContent = `${safeProcessed} / ${safeTotal}`;
+  bar.style.width = `${pct}%`;
+}
+
+function hideNsfwPageProgress() {
+  const panel = document.getElementById('nsfw-page-progress');
+  if (panel) panel.classList.add('hidden');
+}
+
 function onFilterChange() {
   applyFilters();
+  currentPage = 1;
   renderTable();
 }
 
@@ -175,6 +284,7 @@ function resetFilters() {
       if (el) el.checked = false;
     });
   applyFilters();
+  currentPage = 1;
   renderTable();
 }
 
@@ -193,13 +303,15 @@ function setAutoRegisterUiEnabled(enabled) {
 }
 
 function setNsfwRefreshUiEnabled(enabled) {
-  const btn = document.getElementById('btn-refresh-nsfw-all');
-  if (!btn) return;
-  if (enabled) {
-    btn.classList.remove('hidden');
-  } else {
-    btn.classList.add('hidden');
-  }
+  ['btn-refresh-nsfw-all', 'btn-refresh-nsfw-page'].forEach((id) => {
+    const btn = document.getElementById(id);
+    if (!btn) return;
+    if (enabled) {
+      btn.classList.remove('hidden');
+    } else {
+      btn.classList.add('hidden');
+    }
+  });
 }
 
 async function detectWorkersRuntime() {
@@ -235,6 +347,11 @@ if (document.readyState === 'loading') {
 async function init() {
   apiKey = await ensureApiKey();
   if (apiKey === null) return;
+  const pageSizeSelect = document.getElementById('page-size-select');
+  if (pageSizeSelect) {
+    pageSize = normalizePageSize(pageSizeSelect.value);
+    pageSizeSelect.value = pageSize;
+  }
   setupConfirmDialog();
   await maybeRunNsfwRefreshFromQuery();
   loadData();
@@ -450,22 +567,28 @@ function renderTable() {
 
   tbody.innerHTML = '';
   loading.classList.add('hidden');
+  updatePaginationUi();
 
   if (flatTokens.length === 0) {
     emptyState.innerText = '暂无 Token，请点击右上角导入或添加。';
     emptyState.classList.remove('hidden');
+    hideNsfwPageProgress();
     return;
   }
   if (displayTokens.length === 0) {
     emptyState.innerText = '当前筛选无结果。';
     emptyState.classList.remove('hidden');
+    hideNsfwPageProgress();
     updateSelectionState();
     return;
   }
   emptyState.innerText = '暂无 Token，请点击右上角导入或添加。';
   emptyState.classList.add('hidden');
 
-  displayTokens.forEach((item) => {
+  const pageTokens = getCurrentPageTokens();
+  updatePaginationUi();
+
+  pageTokens.forEach((item) => {
     const tr = document.createElement('tr');
     const tokenKey = getTokenKey(item.token);
     const tokenEncoded = encodeURIComponent(item.token);
@@ -479,12 +602,11 @@ function renderTable() {
     // Token (Left)
     const tdToken = document.createElement('td');
     tdToken.className = 'text-left';
-    const tokenShort = item.token.length > 24
-      ? item.token.substring(0, 8) + '...' + item.token.substring(item.token.length - 16)
-      : item.token;
+    const tokenFull = `sso=${item.token}`;
+    const tokenFullEscaped = escapeHtml(tokenFull);
     tdToken.innerHTML = `
-                <div class="flex items-center gap-2">
-                    <span class="font-mono text-xs text-gray-500" title="${item.token}">${tokenShort}</span>
+                <div class="token-cell-wrap">
+                    <span class="token-cell-text" title="${tokenFullEscaped}">${tokenFullEscaped}</span>
                     <button class="text-gray-400 hover:text-black transition-colors" onclick="copyToClipboard(decodeURIComponent('${tokenEncoded}'), this)">
                         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
                     </button>
@@ -519,8 +641,9 @@ function renderTable() {
 
     // Note (Left)
     const tdNote = document.createElement('td');
-    tdNote.className = 'text-left text-gray-500 text-xs truncate max-w-[150px]';
-    tdNote.innerText = item.note || '-';
+    tdNote.className = 'text-left';
+    const noteText = escapeHtml(item.note || '-');
+    tdNote.innerHTML = `<span class="note-cell-text" title="${noteText}">${noteText}</span>`;
 
     // Actions (Center)
     const tdActions = document.createElement('td');
@@ -558,7 +681,7 @@ function renderTable() {
 function toggleSelectAll() {
   const checkbox = document.getElementById('select-all');
   const checked = checkbox.checked;
-  const visibleKeys = new Set(displayTokens.map((t) => getTokenKey(t.token)));
+  const visibleKeys = new Set(getCurrentPageTokens().map((t) => getTokenKey(t.token)));
   flatTokens.forEach((t) => {
     if (visibleKeys.has(getTokenKey(t.token))) {
       t._selected = checked;
@@ -576,10 +699,15 @@ function toggleSelectByKey(tokenKey) {
 
 function updateSelectionState() {
   const selectedCount = flatTokens.filter(t => t._selected).length;
-  const allSelected = displayTokens.length > 0 && displayTokens.every((t) => t._selected);
+  const pageTokens = getCurrentPageTokens();
+  const allSelected = pageTokens.length > 0 && pageTokens.every((t) => t._selected);
+  const someSelected = pageTokens.some((t) => t._selected);
 
   const selectAll = document.getElementById('select-all');
-  if (selectAll) selectAll.checked = allSelected;
+  if (selectAll) {
+    selectAll.checked = allSelected;
+    selectAll.indeterminate = !allSelected && someSelected;
+  }
   document.getElementById('selected-count').innerText = selectedCount;
   setActionButtonsState();
 }
@@ -1110,10 +1238,12 @@ async function submitImport() {
   const pool = document.getElementById('import-pool').value.trim() || 'ssoBasic';
   const text = document.getElementById('import-text').value;
   const lines = text.split('\n');
+  let addedCount = 0;
 
   lines.forEach(line => {
     const t = normalizeSsoToken(line.trim());
     if (t && !flatTokens.some(ft => getTokenKey(ft.token) === t)) {
+      addedCount += 1;
       flatTokens.push({
         token: t,
         pool: pool,
@@ -1131,10 +1261,20 @@ async function submitImport() {
     }
   });
 
-  await syncToServer();
+  if (addedCount === 0) {
+    showToast('没有可导入的新 Token', 'info');
+    return;
+  }
+
+  const saved = await syncToServer();
+  if (!saved) {
+    await loadData();
+    return;
+  }
+
   closeImportModal();
-  applyFilters();
-  loadData();
+  await loadData();
+  showToast(`导入完成，新增 ${addedCount} 个 Token`, 'success');
 }
 
 // Export Logic
@@ -1215,6 +1355,10 @@ async function refreshAllNsfw() {
     showToast('NSFW 刷新任务进行中', 'info');
     return;
   }
+  if (isNsfwRefreshPageRunning) {
+    showToast('当前页 NSFW 刷新进行中', 'info');
+    return;
+  }
 
   const ok = await confirmAction(
     '将对全部 Token 执行：同意用户协议 + 设置年龄 + 开启 NSFW。未成功的 Token 会自动标记为失效，是否继续？',
@@ -1264,6 +1408,109 @@ async function refreshAllNsfw() {
       btn.disabled = false;
       btn.innerHTML = originalText || '一键刷新 NSFW';
     }
+  }
+}
+
+async function refreshCurrentPageNsfw() {
+  if (isNsfwRefreshPageRunning) {
+    showToast('当前页 NSFW 刷新进行中', 'info');
+    return;
+  }
+  if (isNsfwRefreshAllRunning) {
+    showToast('全量 NSFW 刷新进行中', 'info');
+    return;
+  }
+
+  const pageTokens = getCurrentPageTokens();
+  const normalizedTokens = [...new Set(pageTokens.map((x) => normalizeSsoToken(x.token)).filter(Boolean))];
+  if (normalizedTokens.length === 0) {
+    showToast('当前页无可刷新的 Token', 'info');
+    return;
+  }
+
+  const ok = await confirmAction(
+    `将仅刷新当前页 ${normalizedTokens.length} 个 Token 的协议/年龄/NSFW，是否继续？`,
+    { okText: '开始刷新' }
+  );
+  if (!ok) return;
+
+  const btn = document.getElementById('btn-refresh-nsfw-page');
+  const originalText = btn ? btn.innerHTML : '';
+  isNsfwRefreshPageRunning = true;
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '刷新中...';
+  }
+
+  let processed = 0;
+  let success = 0;
+  let failed = 0;
+  let invalidated = 0;
+  setNsfwPageProgress(normalizedTokens.length, processed);
+
+  try {
+    for (let i = 0; i < normalizedTokens.length; i += NSFW_PAGE_BATCH_SIZE) {
+      const chunk = normalizedTokens.slice(i, i + NSFW_PAGE_BATCH_SIZE);
+
+      try {
+        const res = await fetch('/api/v1/admin/tokens/nsfw/refresh', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...buildAuthHeaders(apiKey)
+          },
+          body: JSON.stringify({ tokens: chunk })
+        });
+
+        const payload = await parseJsonSafely(res);
+        if (!res.ok) {
+          failed += chunk.length;
+        } else {
+          const summary = payload?.summary || {};
+          const chunkSuccess = Number(summary.success || 0);
+          const chunkFailed = Number(summary.failed || 0);
+          const chunkInvalidated = Number(summary.invalidated || 0);
+
+          if (chunkSuccess + chunkFailed > 0) {
+            success += chunkSuccess;
+            failed += chunkFailed;
+          } else {
+            const resultMap = payload?.results && typeof payload.results === 'object'
+              ? payload.results
+              : {};
+            chunk.forEach((rawToken) => {
+              const byRaw = resultMap[rawToken];
+              const bySso = resultMap[`sso=${rawToken}`];
+              if (byRaw === true || bySso === true) success += 1;
+              else failed += 1;
+            });
+          }
+          invalidated += chunkInvalidated;
+        }
+      } catch (e) {
+        failed += chunk.length;
+      } finally {
+        processed += chunk.length;
+        setNsfwPageProgress(normalizedTokens.length, processed);
+      }
+    }
+
+    showToast(
+      `当前页 NSFW 刷新完成：总计 ${normalizedTokens.length}，成功 ${success}，失败 ${failed}，失效 ${invalidated}`,
+      failed > 0 ? 'info' : 'success'
+    );
+    await loadData();
+  } catch (e) {
+    showToast(e?.message ? `当前页 NSFW 刷新失败: ${e.message}` : '当前页 NSFW 刷新失败', 'error');
+  } finally {
+    isNsfwRefreshPageRunning = false;
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = originalText || '刷新当前页 NSFW';
+    }
+    setTimeout(() => {
+      if (!isNsfwRefreshPageRunning) hideNsfwPageProgress();
+    }, 1200);
   }
 }
 
