@@ -1323,53 +1323,52 @@ async function submitImport() {
 
     const existing = new Set(flatTokens.map((ft) => getTokenKey(ft.token)));
     const toImport = [];
-    lines.forEach((line) => {
-      const token = normalizeSsoToken(line.trim());
-      if (!token || existing.has(token)) return;
-      existing.add(token);
-      toImport.push(token);
-    });
+    const totalLines = lines.length;
+    setImportProgress(totalLines, 0);
+
+    for (let i = 0; i < lines.length; i += 1) {
+      const token = normalizeSsoToken(lines[i].trim());
+      if (token && !existing.has(token)) {
+        existing.add(token);
+        toImport.push(token);
+      }
+      if ((i + 1) % 25 === 0 || i === lines.length - 1) {
+        setImportProgress(totalLines, i + 1);
+      }
+    }
 
     if (toImport.length === 0) {
       showToast('没有可导入的新 Token', 'info');
       return;
     }
 
-    const IMPORT_SAVE_BATCH_SIZE = 20;
     const workingTokens = flatTokens.slice();
-    let processed = 0;
-    let saved = null;
-    setImportProgress(toImport.length, processed);
-
-    for (let i = 0; i < toImport.length; i += IMPORT_SAVE_BATCH_SIZE) {
-      const chunk = toImport.slice(i, i + IMPORT_SAVE_BATCH_SIZE);
-      chunk.forEach((token) => {
-        workingTokens.push({
-          token,
-          pool,
-          status: 'active',
-          quota: 80,
-          quota_known: true,
-          heavy_quota: -1,
-          heavy_quota_known: false,
-          token_type: poolToType(pool),
-          note: '',
-          use_count: 0,
-          nsfw_enabled: false,
-          _selected: false
-        });
+    toImport.forEach((token) => {
+      workingTokens.push({
+        token,
+        pool,
+        status: 'active',
+        quota: 80,
+        quota_known: true,
+        heavy_quota: -1,
+        heavy_quota_known: false,
+        token_type: poolToType(pool),
+        note: '',
+        use_count: 0,
+        nsfw_enabled: false,
+        _selected: false
       });
+    });
 
-      flatTokens = workingTokens.slice();
-      saved = await syncToServer();
-      processed += chunk.length;
-      setImportProgress(toImport.length, processed);
+    flatTokens = workingTokens.slice();
+    const progressText = document.getElementById('import-progress-text');
+    if (progressText) progressText.textContent = `${toImport.length} / ${toImport.length}（保存中）`;
 
-      if (!saved) {
-        showToast('导入保存失败，已回滚到服务端真实数据', 'error');
-        await loadData();
-        return;
-      }
+    const saved = await syncToServer();
+    if (!saved) {
+      showToast('导入保存失败，已回滚到服务端真实数据', 'error');
+      await loadData();
+      return;
     }
 
     const serverAfterRes = await fetch('/api/v1/admin/tokens', {
