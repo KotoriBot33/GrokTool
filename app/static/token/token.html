@@ -30,7 +30,7 @@
           <p class="text-[var(--accents-4)] mt-1 text-sm">管理 Grok2API 的 Token 服务号池。</p>
         </div>
         <div class="flex items-center gap-3 w-full sm:w-auto">
-          <button onclick="openImportModal()" class="geist-button-outline gap-2">
+          <button id="btn-open-import" onclick="openImportModal()" class="geist-button-outline gap-2">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
               stroke-linecap="round" stroke-linejoin="round">
               <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
@@ -335,9 +335,18 @@
           <textarea id="import-text" class="geist-input font-mono h-48"
             placeholder="粘贴 Token，一行一个..."></textarea>
         </div>
+        <div id="import-progress" class="hidden bg-white border border-[var(--border)] rounded-lg px-3 py-2">
+          <div class="flex items-center justify-between gap-3 text-xs text-[var(--accents-5)]">
+            <span>导入进度</span>
+            <span id="import-progress-text">0 / 0</span>
+          </div>
+          <div class="nsfw-progress-track mt-2">
+            <div id="import-progress-bar" class="nsfw-progress-bar" style="width: 0%;"></div>
+          </div>
+        </div>
         <div class="flex justify-end gap-2 pt-2">
           <button onclick="closeImportModal()" class="geist-button-outline text-xs px-3">取消</button>
-          <button onclick="submitImport()" class="geist-button text-xs px-3">开始导入</button>
+          <button id="btn-import-submit" onclick="submitImport()" class="geist-button text-xs px-3">开始导入</button>
         </div>
       </div>
     </div>
@@ -404,7 +413,7 @@
   <script src="/static/common/header.js?v=4"></script>
   <script src="/static/common/footer.js?v=1"></script>
   <script src="/static/common/toast.js"></script>
-  <script src="/static/token/token.js?v=16"></script>
+  <script src="/static/token/token.js?v=17"></script>
 </body>
 
 </html>

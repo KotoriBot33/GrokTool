@@ -16,6 +16,7 @@ let isWorkersRuntime = false;
 let isNsfwRefreshAllRunning = false;
 let isNsfwRefreshPageRunning = false;
 let nsfwAutoRefreshDone = false;
+let isImportRunning = false;
 
 let displayTokens = [];
 let currentPage = 1;
@@ -120,6 +121,54 @@ function isTokenActive(item) {
 
 function getTokenKey(token) {
   return normalizeSsoToken(token);
+}
+
+function countTokensFromData(data) {
+  let total = 0;
+  Object.keys(data || {}).forEach((pool) => {
+    const tokens = data[pool];
+    if (!Array.isArray(tokens)) return;
+    tokens.forEach((raw) => {
+      const row = normalizeTokenRecord(pool, raw);
+      if (row) total += 1;
+    });
+  });
+  return total;
+}
+
+function setImportUiRunning(running, options = {}) {
+  const openBtn = document.getElementById('btn-open-import');
+  const submitBtn = document.getElementById('btn-import-submit');
+  const input = document.getElementById('import-text');
+  const pool = document.getElementById('import-pool');
+  const progressPanel = document.getElementById('import-progress');
+  const keepProgress = Boolean(options.keepProgress);
+
+  if (openBtn) openBtn.disabled = running;
+  if (submitBtn) {
+    submitBtn.disabled = running;
+    submitBtn.textContent = running ? '处理中...' : '开始导入';
+  }
+  if (input) input.disabled = running;
+  if (pool) pool.disabled = running;
+  if (progressPanel && !running && !keepProgress) {
+    progressPanel.classList.add('hidden');
+  }
+}
+
+function setImportProgress(total, processed) {
+  const panel = document.getElementById('import-progress');
+  const text = document.getElementById('import-progress-text');
+  const bar = document.getElementById('import-progress-bar');
+  if (!panel || !text || !bar) return;
+
+  const safeTotal = Math.max(0, Number(total) || 0);
+  const safeProcessed = Math.max(0, Math.min(safeTotal, Number(processed) || 0));
+  const pct = safeTotal > 0 ? Math.floor((safeProcessed / safeTotal) * 100) : 0;
+
+  panel.classList.remove('hidden');
+  text.textContent = `${safeProcessed} / ${safeTotal}`;
+  bar.style.width = `${pct}%`;
 }
 
 function findTokenIndexByKey(tokenKey) {
@@ -1215,15 +1264,19 @@ async function syncToServer() {
 
 // Import Logic
 function openImportModal() {
+  if (isImportRunning) return;
   const modal = document.getElementById('import-modal');
   if (!modal) return;
+  const progressPanel = document.getElementById('import-progress');
+  if (progressPanel) progressPanel.classList.add('hidden');
   modal.classList.remove('hidden');
   requestAnimationFrame(() => {
     modal.classList.add('is-open');
   });
 }
 
-function closeImportModal() {
+function closeImportModal(force = false) {
+  if (isImportRunning && !force) return;
   const modal = document.getElementById('import-modal');
   if (!modal) return;
   modal.classList.remove('is-open');
@@ -1231,50 +1284,122 @@ function closeImportModal() {
     modal.classList.add('hidden');
     const input = document.getElementById('import-text');
     if (input) input.value = '';
+    const progressPanel = document.getElementById('import-progress');
+    if (progressPanel) progressPanel.classList.add('hidden');
   }, 200);
 }
 
 async function submitImport() {
-  const pool = document.getElementById('import-pool').value.trim() || 'ssoBasic';
-  const text = document.getElementById('import-text').value;
+  if (isImportRunning) {
+    showToast('导入进行中，请稍候', 'info');
+    return;
+  }
+
+  const poolEl = document.getElementById('import-pool');
+  const textEl = document.getElementById('import-text');
+  const pool = (poolEl && poolEl.value.trim()) || 'ssoBasic';
+  const text = (textEl && textEl.value) || '';
   const lines = text.split('\n');
-  let addedCount = 0;
 
-  lines.forEach(line => {
-    const t = normalizeSsoToken(line.trim());
-    if (t && !flatTokens.some(ft => getTokenKey(ft.token) === t)) {
-      addedCount += 1;
-      flatTokens.push({
-        token: t,
-        pool: pool,
-        status: 'active',
-        quota: 80,
-        quota_known: true,
-        heavy_quota: -1,
-        heavy_quota_known: false,
-        token_type: poolToType(pool),
-        note: '',
-        use_count: 0,
-        nsfw_enabled: false,
-        _selected: false
-      });
+  isImportRunning = true;
+  setImportUiRunning(true);
+
+  try {
+    const serverBeforeRes = await fetch('/api/v1/admin/tokens', {
+      headers: buildAuthHeaders(apiKey)
+    });
+    if (serverBeforeRes.status === 401) {
+      logout();
+      return;
     }
-  });
+    if (!serverBeforeRes.ok) {
+      const payload = await parseJsonSafely(serverBeforeRes);
+      showToast(extractApiErrorMessage(payload, `导入前校验失败: HTTP ${serverBeforeRes.status}`), 'error');
+      await loadData();
+      return;
+    }
+    const serverBefore = await parseJsonSafely(serverBeforeRes) || {};
+    const baselineCount = countTokensFromData(serverBefore);
 
-  if (addedCount === 0) {
-    showToast('没有可导入的新 Token', 'info');
-    return;
-  }
+    const existing = new Set(flatTokens.map((ft) => getTokenKey(ft.token)));
+    const toImport = [];
+    lines.forEach((line) => {
+      const token = normalizeSsoToken(line.trim());
+      if (!token || existing.has(token)) return;
+      existing.add(token);
+      toImport.push(token);
+    });
 
-  const saved = await syncToServer();
-  if (!saved) {
+    if (toImport.length === 0) {
+      showToast('没有可导入的新 Token', 'info');
+      return;
+    }
+
+    const IMPORT_SAVE_BATCH_SIZE = 20;
+    const workingTokens = flatTokens.slice();
+    let processed = 0;
+    let saved = null;
+    setImportProgress(toImport.length, processed);
+
+    for (let i = 0; i < toImport.length; i += IMPORT_SAVE_BATCH_SIZE) {
+      const chunk = toImport.slice(i, i + IMPORT_SAVE_BATCH_SIZE);
+      chunk.forEach((token) => {
+        workingTokens.push({
+          token,
+          pool,
+          status: 'active',
+          quota: 80,
+          quota_known: true,
+          heavy_quota: -1,
+          heavy_quota_known: false,
+          token_type: poolToType(pool),
+          note: '',
+          use_count: 0,
+          nsfw_enabled: false,
+          _selected: false
+        });
+      });
+
+      flatTokens = workingTokens.slice();
+      saved = await syncToServer();
+      processed += chunk.length;
+      setImportProgress(toImport.length, processed);
+
+      if (!saved) {
+        showToast('导入保存失败，已回滚到服务端真实数据', 'error');
+        await loadData();
+        return;
+      }
+    }
+
+    const serverAfterRes = await fetch('/api/v1/admin/tokens', {
+      headers: buildAuthHeaders(apiKey)
+    });
+    if (serverAfterRes.status === 401) {
+      logout();
+      return;
+    }
+    if (!serverAfterRes.ok) {
+      const payload = await parseJsonSafely(serverAfterRes);
+      showToast(extractApiErrorMessage(payload, `导入后校验失败: HTTP ${serverAfterRes.status}`), 'error');
+      await loadData();
+      return;
+    }
+
+    const serverAfter = await parseJsonSafely(serverAfterRes) || {};
+    const finalCount = countTokensFromData(serverAfter);
+    const serverAdded = Math.max(0, finalCount - baselineCount);
+    const triggeredAdded = Number(saved?.nsfw_refresh?.triggered || 0);
+    const actualAdded = Math.max(serverAdded, triggeredAdded);
+
+    setImportProgress(toImport.length, toImport.length);
+    showToast(`导入完成，服务端实际新增 ${actualAdded} 个 Token`, 'success');
+    closeImportModal(true);
     await loadData();
-    return;
+  } finally {
+    isImportRunning = false;
+    setImportUiRunning(false);
   }
-
-  closeImportModal();
-  await loadData();
-  showToast(`导入完成，新增 ${addedCount} 个 Token`, 'success');
 }
 
 // Export Logic
