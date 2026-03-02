@@ -8,6 +8,15 @@ import { runKvDailyClear } from "./kv/cleanup";
 
 const app = new Hono<{ Bindings: Env }>();
 
+// Backward-compatible local-cache viewer URLs used by the multi-page admin UI.
+// Keep these routes before /v1 auth middleware so they won't hit missing_token.
+app.get("/v1/files/image/:imgPath{.+}", (c) =>
+  c.redirect(`/images/${encodeURIComponent(c.req.param("imgPath"))}`, 302),
+);
+app.get("/v1/files/video/:imgPath{.+}", (c) =>
+  c.redirect(`/images/${encodeURIComponent(c.req.param("imgPath"))}`, 302),
+);
+
 function getAssets(env: Env): Fetcher | null {
   const anyEnv = env as unknown as { ASSETS?: unknown };
   const assets = anyEnv.ASSETS as { fetch?: unknown } | undefined;
@@ -86,15 +95,6 @@ app.route("/v1", openAiRoutes);
 app.route("/", mediaRoutes);
 app.route("/", adminRoutes);
 app.route("/", publicRoutes);
-
-// Backward-compatible local-cache viewer URLs used by the multi-page admin UI.
-// In Workers we serve cache via /images/*, so redirect /v1/files/* to /images/*.
-app.get("/v1/files/image/:imgPath{.+}", (c) =>
-  c.redirect(`/images/${encodeURIComponent(c.req.param("imgPath"))}`, 302),
-);
-app.get("/v1/files/video/:imgPath{.+}", (c) =>
-  c.redirect(`/images/${encodeURIComponent(c.req.param("imgPath"))}`, 302),
-);
 
 app.get("/_worker.js", (c) => c.notFound());
 

@@ -17,6 +17,7 @@ let isNsfwRefreshAllRunning = false;
 let isNsfwRefreshPageRunning = false;
 let nsfwAutoRefreshDone = false;
 let isImportRunning = false;
+let nsfwRefreshAllPollTimer = null;
 
 let displayTokens = [];
 let currentPage = 1;
@@ -388,6 +389,52 @@ function setNsfwPageProgress(total, processed) {
 function hideNsfwPageProgress() {
   const panel = document.getElementById('nsfw-page-progress');
   if (panel) panel.classList.add('hidden');
+}
+
+function stopNsfwRefreshAllPolling() {
+  if (nsfwRefreshAllPollTimer) {
+    clearInterval(nsfwRefreshAllPollTimer);
+    nsfwRefreshAllPollTimer = null;
+  }
+}
+
+async function fetchNsfwRefreshProgress() {
+  const res = await fetch('/api/v1/admin/tokens/nsfw/refresh-progress', {
+    headers: buildAuthHeaders(apiKey)
+  });
+  const payload = await parseJsonSafely(res);
+  if (!res.ok) {
+    throw new Error(extractApiErrorMessage(payload, `HTTP ${res.status}`));
+  }
+  return payload?.data || {};
+}
+
+function setNsfwRefreshAllProgressFromData(progress) {
+  const total = Math.max(0, Number(progress?.total) || 0);
+  const current = Math.max(0, Math.min(total, Number(progress?.current) || 0));
+  setNsfwPageProgress(total, current);
+}
+
+async function waitUntilNsfwRefreshDone() {
+  return new Promise((resolve, reject) => {
+    const tick = async () => {
+      try {
+        const progress = await fetchNsfwRefreshProgress();
+        setNsfwRefreshAllProgressFromData(progress);
+        if (!progress?.running) {
+          stopNsfwRefreshAllPolling();
+          resolve(progress);
+        }
+      } catch (e) {
+        stopNsfwRefreshAllPolling();
+        reject(e);
+      }
+    };
+
+    stopNsfwRefreshAllPolling();
+    nsfwRefreshAllPollTimer = setInterval(tick, 1000);
+    tick();
+  });
 }
 
 function onFilterChange() {
@@ -1521,6 +1568,7 @@ async function refreshAllNsfw() {
   const btn = document.getElementById('btn-refresh-nsfw-all');
   const originalText = btn ? btn.innerHTML : '';
   isNsfwRefreshAllRunning = true;
+  setNsfwPageProgress(0, 0);
   if (btn) {
     btn.disabled = true;
     btn.innerHTML = '刷新中...';
@@ -1537,29 +1585,35 @@ async function refreshAllNsfw() {
     });
 
     const payload = await parseJsonSafely(res);
-    if (!res.ok) {
+    if (!res.ok && res.status !== 409) {
       showToast(extractApiErrorMessage(payload, 'NSFW 刷新失败'), 'error');
       return;
     }
 
-    const summary = payload?.summary || {};
-    const total = Number(summary.total || 0);
-    const success = Number(summary.success || 0);
-    const failed = Number(summary.failed || 0);
-    const invalidated = Number(summary.invalidated || 0);
+    const finalProgress = await waitUntilNsfwRefreshDone();
+
+    const total = Number(finalProgress?.total || 0);
+    const success = Number(finalProgress?.success || 0);
+    const failed = Number(finalProgress?.failed || 0);
+    const invalidated = 0;
+
     showToast(
       `NSFW 刷新完成：总计 ${total}，成功 ${success}，失败 ${failed}，失效 ${invalidated}`,
       failed > 0 ? 'info' : 'success'
     );
-    loadData();
+    await loadData();
   } catch (e) {
     showToast(e?.message ? `NSFW 刷新失败: ${e.message}` : 'NSFW 刷新失败', 'error');
   } finally {
+    stopNsfwRefreshAllPolling();
     isNsfwRefreshAllRunning = false;
     if (btn) {
       btn.disabled = false;
       btn.innerHTML = originalText || '一键刷新 NSFW';
     }
+    setTimeout(() => {
+      if (!isNsfwRefreshAllRunning && !isNsfwRefreshPageRunning) hideNsfwPageProgress();
+    }, 1200);
   }
 }
 

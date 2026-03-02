@@ -4,7 +4,12 @@ import type { Env } from "../env";
 import { requireApiAuth } from "../auth";
 import { getSettings, normalizeCfCookie } from "../settings";
 import { isValidModel, MODEL_CONFIG } from "../grok/models";
-import { extractContent, buildConversationPayload, sendConversationRequest } from "../grok/conversation";
+import {
+  extractContent,
+  buildConversationPayload,
+  sendConversationRequest,
+  parseVideoLengthStrict,
+} from "../grok/conversation";
 import { uploadImage } from "../grok/upload";
 import { getDynamicHeaders } from "../grok/headers";
 import { createMediaPost, createPost } from "../grok/create";
@@ -111,6 +116,27 @@ function isContentModerationMessage(message: string): boolean {
     m.includes("content-moderated") ||
     m.includes("wke=grok:content-moderated")
   );
+}
+
+function isContentModeratedError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err ?? "");
+  return isContentModerationMessage(msg) || msg.trim().toLowerCase() === "content_moderated";
+}
+
+async function warmupAssetUrl(url: string): Promise<void> {
+  const target = String(url || "").trim();
+  if (!target) return;
+  try {
+    const headResp = await fetch(target, { method: "HEAD" });
+    if (headResp.ok) return;
+  } catch {
+    // ignore and fallback to GET
+  }
+  try {
+    await fetch(target, { method: "GET" });
+  } catch {
+    // ignore warmup failures
+  }
 }
 
 async function enforceQuota(args: {
@@ -1662,6 +1688,19 @@ openAiRoutes.post("/chat/completions", async (c) => {
 
     const settingsBundle = await getSettings(c.env);
     const cfg = MODEL_CONFIG[requestedModel]!;
+    if (cfg.is_video_model) {
+      const parsedVideoLength = parseVideoLengthStrict(body.video_config?.video_length);
+      if (!parsedVideoLength.ok) {
+        return c.json(
+          openAiError("'video_config.video_length' must be a number between 1 and 15", "invalid_video_length"),
+          400,
+        );
+      }
+      body.video_config = {
+        ...(body.video_config ?? {}),
+        video_length: parsedVideoLength.value,
+      };
+    }
 
     const retryCodes = Array.isArray(settingsBundle.grok.retry_status_codes)
       ? settingsBundle.grok.retry_status_codes
@@ -1738,6 +1777,21 @@ openAiRoutes.post("/chat/completions", async (c) => {
 
         if (!upstream.ok) {
           const txt = await upstream.text().catch(() => "");
+          if (isContentModerationMessage(txt)) {
+            await recordTokenFailure(c.env.DB, jwt, upstream.status, txt.slice(0, 200));
+            await applyCooldown(c.env.DB, jwt, upstream.status);
+            const duration = (Date.now() - start) / 1000;
+            await addRequestLog(c.env.DB, {
+              ip,
+              model: requestedModel,
+              duration: Number(duration.toFixed(2)),
+              status: 400,
+              key_name: keyName,
+              token_suffix: jwt.slice(-6),
+              error: "content_moderated",
+            });
+            return c.json(openAiError("content_moderated", "content_moderated"), 400);
+          }
           lastErr = `Upstream ${upstream.status}: ${txt.slice(0, 200)}`;
           await recordTokenFailure(c.env.DB, jwt, upstream.status, txt.slice(0, 200));
           await applyCooldown(c.env.DB, jwt, upstream.status);
@@ -1752,6 +1806,9 @@ openAiRoutes.post("/chat/completions", async (c) => {
             global: settingsBundle.global,
             origin,
             requestedModel,
+            onAssetReady: (url) => {
+              c.executionCtx.waitUntil(warmupAssetUrl(url));
+            },
             onFinish: async ({ status, duration }) => {
               await addRequestLog(c.env.DB, {
                 ip,
@@ -1783,6 +1840,9 @@ openAiRoutes.post("/chat/completions", async (c) => {
           global: settingsBundle.global,
           origin,
           requestedModel,
+          onAssetReady: (url) => {
+            c.executionCtx.waitUntil(warmupAssetUrl(url));
+          },
         });
 
         const duration = (Date.now() - start) / 1000;
@@ -1798,6 +1858,19 @@ openAiRoutes.post("/chat/completions", async (c) => {
 
         return c.json(json);
       } catch (e) {
+        if (isContentModeratedError(e)) {
+          const duration = (Date.now() - start) / 1000;
+          await addRequestLog(c.env.DB, {
+            ip,
+            model: requestedModel,
+            duration: Number(duration.toFixed(2)),
+            status: 400,
+            key_name: keyName,
+            token_suffix: jwt.slice(-6),
+            error: "content_moderated",
+          });
+          return c.json(openAiError("content_moderated", "content_moderated"), 400);
+        }
         const msg = e instanceof Error ? e.message : String(e);
         lastErr = msg;
         await recordTokenFailure(c.env.DB, jwt, 500, msg);
@@ -1819,6 +1892,19 @@ openAiRoutes.post("/chat/completions", async (c) => {
 
     return c.json(openAiError(lastErr ?? "Upstream error", "upstream_error"), 500);
   } catch (e) {
+    if (isContentModeratedError(e)) {
+      const duration = (Date.now() - start) / 1000;
+      await addRequestLog(c.env.DB, {
+        ip,
+        model: requestedModel || "unknown",
+        duration: Number(duration.toFixed(2)),
+        status: 400,
+        key_name: keyName,
+        token_suffix: "",
+        error: "content_moderated",
+      });
+      return c.json(openAiError("content_moderated", "content_moderated"), 400);
+    }
     const duration = (Date.now() - start) / 1000;
     await addRequestLog(c.env.DB, {
       ip,
@@ -1957,6 +2043,21 @@ openAiRoutes.post("/responses", async (c) => {
 
         if (!upstream.ok) {
           const txt = await upstream.text().catch(() => "");
+          if (isContentModerationMessage(txt)) {
+            await recordTokenFailure(c.env.DB, jwt, upstream.status, txt.slice(0, 200));
+            await applyCooldown(c.env.DB, jwt, upstream.status);
+            const duration = (Date.now() - start) / 1000;
+            await addRequestLog(c.env.DB, {
+              ip,
+              model: requestedModel,
+              duration: Number(duration.toFixed(2)),
+              status: 400,
+              key_name: keyName,
+              token_suffix: jwt.slice(-6),
+              error: "content_moderated",
+            });
+            return c.json(openAiError("content_moderated", "content_moderated"), 400);
+          }
           lastErr = `Upstream ${upstream.status}: ${txt.slice(0, 200)}`;
           await recordTokenFailure(c.env.DB, jwt, upstream.status, txt.slice(0, 200));
           await applyCooldown(c.env.DB, jwt, upstream.status);
@@ -1966,13 +2067,16 @@ openAiRoutes.post("/responses", async (c) => {
 
         const responseId = newResponseId();
 
-        if (stream) {
+      if (stream) {
           const chatSse = createOpenAiStreamFromGrokNdjson(upstream, {
             cookie,
             settings: settingsBundle.grok,
             global: settingsBundle.global,
             origin,
             requestedModel,
+            onAssetReady: (url) => {
+              c.executionCtx.waitUntil(warmupAssetUrl(url));
+            },
           });
 
           const responseSse = createResponsesStreamFromChatSse({
@@ -2018,6 +2122,9 @@ openAiRoutes.post("/responses", async (c) => {
           global: settingsBundle.global,
           origin,
           requestedModel,
+          onAssetReady: (url) => {
+            c.executionCtx.waitUntil(warmupAssetUrl(url));
+          },
         });
 
         const contentText = String(
@@ -2057,6 +2164,19 @@ openAiRoutes.post("/responses", async (c) => {
 
         return c.json(responseJson);
       } catch (e) {
+        if (isContentModeratedError(e)) {
+          const duration = (Date.now() - start) / 1000;
+          await addRequestLog(c.env.DB, {
+            ip,
+            model: requestedModel,
+            duration: Number(duration.toFixed(2)),
+            status: 400,
+            key_name: keyName,
+            token_suffix: jwt.slice(-6),
+            error: "content_moderated",
+          });
+          return c.json(openAiError("content_moderated", "content_moderated"), 400);
+        }
         const msg = e instanceof Error ? e.message : String(e);
         lastErr = msg;
         await recordTokenFailure(c.env.DB, jwt, 500, msg);
@@ -2078,6 +2198,19 @@ openAiRoutes.post("/responses", async (c) => {
 
     return c.json(openAiError(lastErr ?? "Upstream error", "upstream_error"), 500);
   } catch (e) {
+    if (isContentModeratedError(e)) {
+      const duration = (Date.now() - start) / 1000;
+      await addRequestLog(c.env.DB, {
+        ip,
+        model: requestedModel || "unknown",
+        duration: Number(duration.toFixed(2)),
+        status: 400,
+        key_name: keyName,
+        token_suffix: "",
+        error: "content_moderated",
+      });
+      return c.json(openAiError("content_moderated", "content_moderated"), 400);
+    }
     const duration = (Date.now() - start) / 1000;
     await addRequestLog(c.env.DB, {
       ip,

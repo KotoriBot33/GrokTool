@@ -123,6 +123,7 @@ export function createOpenAiStreamFromGrokNdjson(
     origin: string;
     requestedModel: string;
     onFinish?: (result: { status: number; duration: number }) => Promise<void> | void;
+    onAssetReady?: (url: string) => void;
   },
 ): ReadableStream<Uint8Array> {
   const { settings, global, origin } = opts;
@@ -141,6 +142,12 @@ export function createOpenAiStreamFromGrokNdjson(
     .map((t) => t.trim())
     .filter(Boolean);
   const showThinking = settings.show_thinking !== false;
+
+  const warmupAsset = (assetPath: string): void => {
+    if (!assetPath) return;
+    const url = toImgProxyUrl(global, origin, assetPath);
+    opts.onAssetReady?.(url);
+  };
 
   const firstTimeoutMs = Math.max(0, (settings.stream_first_response_timeout ?? 30) * 1000);
   const chunkTimeoutMs = Math.max(0, (settings.stream_chunk_timeout ?? 120) * 1000);
@@ -237,6 +244,17 @@ export function createOpenAiStreamFromGrokNdjson(
 
             const err = (data as any).error;
             if (err?.message) {
+              const errMsg = String(err.message);
+              if (/content\s*-?\s*moderated/i.test(errMsg)) {
+                finalStatus = 400;
+                controller.enqueue(
+                  encoder.encode(makeChunk(id, created, currentModel, "Error: content_moderated", "stop")),
+                );
+                controller.enqueue(encoder.encode(makeDone()));
+                if (opts.onFinish) await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000 });
+                controller.close();
+                return;
+              }
               finalStatus = 500;
               controller.enqueue(
                 encoder.encode(makeChunk(id, created, currentModel, `Error: ${String(err.message)}`, "stop")),
@@ -279,11 +297,13 @@ export function createOpenAiStreamFromGrokNdjson(
               if (videoUrl) {
                 const videoPath = encodeAssetPath(videoUrl);
                 const src = toImgProxyUrl(global, origin, videoPath);
+                warmupAsset(videoPath);
 
                 let poster: string | undefined;
                 if (thumbUrl) {
                   const thumbPath = encodeAssetPath(thumbUrl);
                   poster = toImgProxyUrl(global, origin, thumbPath);
+                  warmupAsset(thumbPath);
                 }
 
                 controller.enqueue(
@@ -409,7 +429,14 @@ export function createOpenAiStreamFromGrokNdjson(
 
 export async function parseOpenAiFromGrokNdjson(
   grokResp: Response,
-  opts: { cookie: string; settings: GrokSettings; global: GlobalSettings; origin: string; requestedModel: string },
+  opts: {
+    cookie: string;
+    settings: GrokSettings;
+    global: GlobalSettings;
+    origin: string;
+    requestedModel: string;
+    onAssetReady?: (url: string) => void;
+  },
 ): Promise<Record<string, unknown>> {
   const { global, origin, requestedModel, settings } = opts;
   const text = await grokResp.text();
@@ -426,7 +453,11 @@ export async function parseOpenAiFromGrokNdjson(
     }
 
     const err = (data as any).error;
-    if (err?.message) throw new Error(String(err.message));
+    if (err?.message) {
+      const errMsg = String(err.message);
+      if (/content\s*-?\s*moderated/i.test(errMsg)) throw new Error("content_moderated");
+      throw new Error(errMsg);
+    }
 
     const grok = (data as any).result?.response;
     if (!grok) continue;
@@ -435,11 +466,13 @@ export async function parseOpenAiFromGrokNdjson(
     if (videoResp?.videoUrl && typeof videoResp.videoUrl === "string") {
       const videoPath = encodeAssetPath(videoResp.videoUrl);
       const src = toImgProxyUrl(global, origin, videoPath);
+      opts.onAssetReady?.(src);
 
       let poster: string | undefined;
       if (typeof videoResp.thumbnailImageUrl === "string" && videoResp.thumbnailImageUrl) {
         const thumbPath = encodeAssetPath(videoResp.thumbnailImageUrl);
         poster = toImgProxyUrl(global, origin, thumbPath);
+        opts.onAssetReady?.(poster);
       }
 
       content = buildVideoHtml({

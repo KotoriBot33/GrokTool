@@ -19,6 +19,19 @@ export interface OpenAIChatRequestBody {
   };
 }
 
+export function parseVideoLengthStrict(raw: unknown):
+  | { ok: true; value: number }
+  | { ok: false; reason: "missing" | "not_number" | "out_of_range" } {
+  if (raw === undefined || raw === null || raw === "") {
+    return { ok: false, reason: "missing" };
+  }
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(n)) return { ok: false, reason: "not_number" };
+  const normalized = Math.floor(n);
+  if (normalized < 1 || normalized > 15) return { ok: false, reason: "out_of_range" };
+  return { ok: true, value: normalized };
+}
+
 export const CONVERSATION_API = "https://grok.com/rest/app-chat/conversations/new";
 
 export function extractContent(messages: OpenAIChatMessage[]): { content: string; images: string[] } {
@@ -90,8 +103,11 @@ export function buildConversationPayload(args: {
     if (!postId) throw new Error("视频模型缺少 postId（需要先创建 media post）");
 
     const aspectRatio = (args.videoConfig?.aspect_ratio ?? "").trim() || "3:2";
-    const videoLengthRaw = Number(args.videoConfig?.video_length ?? 6);
-    const videoLength = Number.isFinite(videoLengthRaw) ? Math.max(1, Math.floor(videoLengthRaw)) : 6;
+    const parsedVideoLength = parseVideoLengthStrict(args.videoConfig?.video_length);
+    if (!parsedVideoLength.ok) {
+      throw new Error("invalid_video_length");
+    }
+    const videoLength = parsedVideoLength.value;
     const resolution = (args.videoConfig?.resolution ?? "SD") === "HD" ? "HD" : "SD";
     const preset = (args.videoConfig?.preset ?? "normal").trim();
 

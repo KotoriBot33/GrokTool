@@ -49,6 +49,8 @@ import { dbAll, dbFirst, dbRun } from "../db";
 import { nowMs } from "../utils/time";
 import { listUsageForDay, localDayString } from "../repo/apiKeyUsage";
 
+const NSFW_REFRESH_ITEM_TIMEOUT_MS = 20000;
+
 function jsonError(message: string, code: string): Record<string, unknown> {
   return { error: message, code };
 }
@@ -118,6 +120,21 @@ async function clearKvCacheByType(
     if (keys.length < batch) break;
   }
   return deleted;
+}
+
+async function runWithTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  if (!(timeoutMs > 0)) return promise;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("nsfw_refresh_timeout")), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function base64UrlEncodeString(input: string): string {
@@ -1013,6 +1030,15 @@ adminRoutes.post("/api/v1/admin/tokens/nsfw/refresh", requireAdminAuth, async (c
 
     let targets: string[] = [...new Set(requested.map((t) => normalizeSsoToken(t)).filter(Boolean))] as string[];
     if (all || !targets.length) {
+      const progress = await getRefreshProgress(c.env.DB);
+      if (progress.running) {
+        return c.json({
+          success: false,
+          message: "NSFW refresh already running",
+          data: progress,
+          code: "nsfw_refresh_running",
+        }, 409);
+      }
       const rows = await listTokens(c.env.DB);
       targets = [...new Set(rows.map((r) => normalizeSsoToken(r.token)).filter(Boolean))] as string[];
     }
@@ -1025,6 +1051,17 @@ adminRoutes.post("/api/v1/admin/tokens/nsfw/refresh", requireAdminAuth, async (c
     const cf = normalizeCfCookie(settings.grok.cf_clearance ?? "");
     const concurrency = Math.max(1, Math.min(20, Math.floor(Number(settings.token.nsfw_refresh_concurrency ?? 10) || 10)));
     const retries = Math.max(0, Math.min(10, Math.floor(Number(settings.token.nsfw_refresh_retries ?? 3) || 3)));
+    const shouldTrackProgress = all || targets.length > 20;
+
+    if (shouldTrackProgress) {
+      await setRefreshProgress(c.env.DB, {
+        running: true,
+        current: 0,
+        total: targets.length,
+        success: 0,
+        failed: 0,
+      });
+    }
 
     const refreshOne = async (token: string): Promise<{ token: string; ok: boolean; reason?: string }> => {
       const modelsToTry = ["grok-4", "grok-4.20-beta", "grok-3"];
@@ -1034,7 +1071,10 @@ adminRoutes.post("/api/v1/admin/tokens/nsfw/refresh", requireAdminAuth, async (c
           const cookie = cf ? `sso-rw=${token};sso=${token};${cf}` : `sso-rw=${token};sso=${token}`;
           let success = false;
           for (const model of modelsToTry) {
-            const r = await checkRateLimits(cookie, settings.grok, model);
+            const r = await runWithTimeout(
+              checkRateLimits(cookie, settings.grok, model),
+              NSFW_REFRESH_ITEM_TIMEOUT_MS,
+            );
             const remaining = Number((r as any)?.remainingTokens);
             if (Number.isFinite(remaining)) {
               await updateTokenLimits(c.env.DB, token, { remaining_queries: Math.max(-1, Math.floor(remaining)) });
@@ -1064,7 +1104,45 @@ adminRoutes.post("/api/v1/admin/tokens/nsfw/refresh", requireAdminAuth, async (c
       return { token, ok: false, ...(lastReason ? { reason: lastReason } : {}) };
     };
 
-    const settled = await runTasksSettledWithLimit(targets, concurrency, refreshOne);
+    let settled: PromiseSettledResult<{ token: string; ok: boolean; reason?: string }>[] = [];
+    if (shouldTrackProgress) {
+      const results: PromiseSettledResult<{ token: string; ok: boolean; reason?: string }>[] = new Array(targets.length);
+      let nextIndex = 0;
+      let current = 0;
+      let successCount = 0;
+      let failedCount = 0;
+      const workerCount = Math.max(1, Math.min(concurrency, targets.length));
+
+      const workers = Array.from({ length: workerCount }, async () => {
+        while (true) {
+          const idx = nextIndex++;
+          if (idx >= targets.length) break;
+          try {
+            const value = await refreshOne(targets[idx] as string);
+            results[idx] = { status: "fulfilled", value };
+            if (value.ok) successCount += 1;
+            else failedCount += 1;
+          } catch (reason) {
+            results[idx] = { status: "rejected", reason };
+            failedCount += 1;
+          } finally {
+            current += 1;
+            await setRefreshProgress(c.env.DB, {
+              running: true,
+              current,
+              total: targets.length,
+              success: successCount,
+              failed: failedCount,
+            });
+          }
+        }
+      });
+
+      await Promise.all(workers);
+      settled = results;
+    } else {
+      settled = await runTasksSettledWithLimit(targets, concurrency, refreshOne);
+    }
     const details: Array<{ token: string; success: boolean; reason?: string }> = [];
     const successTokens: string[] = [];
     let success = 0;
@@ -1104,6 +1182,15 @@ adminRoutes.post("/api/v1/admin/tokens/nsfw/refresh", requireAdminAuth, async (c
     }
 
     const results = Object.fromEntries(details.map((d) => [d.token, d.success]));
+    if (shouldTrackProgress) {
+      await setRefreshProgress(c.env.DB, {
+        running: false,
+        current: targets.length,
+        total: targets.length,
+        success,
+        failed,
+      });
+    }
     return c.json({
       success: true,
       triggered: targets.length,
@@ -1119,7 +1206,21 @@ adminRoutes.post("/api/v1/admin/tokens/nsfw/refresh", requireAdminAuth, async (c
       details,
     });
   } catch (e) {
+    try {
+      await setRefreshProgress(c.env.DB, { running: false });
+    } catch {
+      // ignore secondary errors
+    }
     return c.json(legacyErr(`NSFW refresh failed: ${e instanceof Error ? e.message : String(e)}`), 500);
+  }
+});
+
+adminRoutes.get("/api/v1/admin/tokens/nsfw/refresh-progress", requireAdminAuth, async (c) => {
+  try {
+    const progress = await getRefreshProgress(c.env.DB);
+    return c.json({ success: true, data: progress });
+  } catch (e) {
+    return c.json(jsonError(`获取失败: ${e instanceof Error ? e.message : String(e)}`, "GET_NSFW_PROGRESS_ERROR"), 500);
   }
 });
 

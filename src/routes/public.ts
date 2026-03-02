@@ -2,7 +2,12 @@ import { Hono } from "hono";
 import type { Env } from "../env";
 import { getSettings } from "../settings";
 import { MODEL_CONFIG, isValidModel } from "../grok/models";
-import { extractContent, buildConversationPayload, sendConversationRequest } from "../grok/conversation";
+import {
+  extractContent,
+  buildConversationPayload,
+  sendConversationRequest,
+  parseVideoLengthStrict,
+} from "../grok/conversation";
 import { uploadImage } from "../grok/upload";
 import { createMediaPost, createPost } from "../grok/create";
 import { createOpenAiStreamFromGrokNdjson, parseOpenAiFromGrokNdjson } from "../grok/processor";
@@ -77,6 +82,32 @@ function normalizeCfCookie(value: string): string {
   const v = String(value ?? "").trim();
   if (!v) return "";
   return v.startsWith("cf_clearance=") ? v : `cf_clearance=${v}`;
+}
+
+function isContentModerationMessage(message: string): boolean {
+  const m = String(message || "").toLowerCase();
+  return (
+    m.includes("content moderated") ||
+    m.includes("content-moderated") ||
+    m.includes("wke=grok:content-moderated") ||
+    m.trim() === "content_moderated"
+  );
+}
+
+async function warmupAssetUrl(url: string): Promise<void> {
+  const target = String(url || "").trim();
+  if (!target) return;
+  try {
+    const headResp = await fetch(target, { method: "HEAD" });
+    if (headResp.ok) return;
+  } catch {
+    // ignore and fallback to GET
+  }
+  try {
+    await fetch(target, { method: "GET" });
+  } catch {
+    // ignore warmup errors
+  }
 }
 
 function bytesToBase64Url(bytes: Uint8Array): string {
@@ -427,6 +458,21 @@ publicRoutes.post("/api/v1/public/chat/completions", async (c) => {
   if (!Array.isArray(body.messages)) return c.json(openAiError("Missing 'messages'", "missing_messages"), 400);
   if (!isValidModel(requestedModel)) return c.json(openAiError(`Model '${requestedModel}' not supported`, "model_not_supported"), 400);
 
+  const modelCfg = MODEL_CONFIG[requestedModel]!;
+  if (modelCfg.is_video_model) {
+    const parsedVideoLength = parseVideoLengthStrict(body.video_config?.video_length);
+    if (!parsedVideoLength.ok) {
+      return c.json(
+        openAiError("'video_config.video_length' must be a number between 1 and 15", "invalid_video_length"),
+        400,
+      );
+    }
+    body.video_config = {
+      ...(body.video_config ?? {}),
+      video_length: parsedVideoLength.value,
+    };
+  }
+
   const maxMessages = Math.max(1, Math.floor(Number(settingsBundle.public.max_messages ?? 24) || 24));
   if (body.messages.length > maxMessages) {
     return c.json(openAiError(`Too many messages: ${body.messages.length} > ${maxMessages}`, "too_many_messages"), 400);
@@ -529,6 +575,21 @@ publicRoutes.post("/api/v1/public/chat/completions", async (c) => {
 
         if (!upstream.ok) {
           const txt = await upstream.text().catch(() => "");
+          if (isContentModerationMessage(txt)) {
+            const duration = (Date.now() - start) / 1000;
+            await recordTokenFailure(c.env.DB, jwt, upstream.status, txt.slice(0, 200));
+            await applyCooldown(c.env.DB, jwt, upstream.status);
+            await addRequestLog(c.env.DB, {
+              ip,
+              model: requestedModel,
+              duration: Number(duration.toFixed(2)),
+              status: 400,
+              key_name: keyName,
+              token_suffix: jwt.slice(-6),
+              error: "content_moderated",
+            });
+            return c.json(openAiError("content_moderated", "content_moderated"), 400);
+          }
           lastErr = `Upstream ${upstream.status}: ${txt.slice(0, 200)}`;
           await recordTokenFailure(c.env.DB, jwt, upstream.status, txt.slice(0, 200));
           await applyCooldown(c.env.DB, jwt, upstream.status);
@@ -543,6 +604,9 @@ publicRoutes.post("/api/v1/public/chat/completions", async (c) => {
             global: settingsBundle.global,
             origin,
             requestedModel,
+            onAssetReady: (url) => {
+              c.executionCtx.waitUntil(warmupAssetUrl(url));
+            },
             onFinish: async ({ status, duration }) => {
               await addRequestLog(c.env.DB, {
                 ip,
@@ -574,6 +638,9 @@ publicRoutes.post("/api/v1/public/chat/completions", async (c) => {
           global: settingsBundle.global,
           origin,
           requestedModel,
+          onAssetReady: (url) => {
+            c.executionCtx.waitUntil(warmupAssetUrl(url));
+          },
         });
 
         const duration = (Date.now() - start) / 1000;
@@ -589,6 +656,20 @@ publicRoutes.post("/api/v1/public/chat/completions", async (c) => {
 
         return c.json(json);
       } catch (e) {
+        const emsg = e instanceof Error ? e.message : String(e);
+        if (isContentModerationMessage(emsg)) {
+          const duration = (Date.now() - start) / 1000;
+          await addRequestLog(c.env.DB, {
+            ip,
+            model: requestedModel,
+            duration: Number(duration.toFixed(2)),
+            status: 400,
+            key_name: keyName,
+            token_suffix: jwt.slice(-6),
+            error: "content_moderated",
+          });
+          return c.json(openAiError("content_moderated", "content_moderated"), 400);
+        }
         const msg = e instanceof Error ? e.message : String(e);
         lastErr = msg;
         await recordTokenFailure(c.env.DB, jwt, 500, msg);
@@ -610,6 +691,20 @@ publicRoutes.post("/api/v1/public/chat/completions", async (c) => {
 
     return c.json(openAiError("Upstream error", "upstream_error"), 500);
   } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (isContentModerationMessage(msg)) {
+      const duration = (Date.now() - start) / 1000;
+      await addRequestLog(c.env.DB, {
+        ip,
+        model: requestedModel || "unknown",
+        duration: Number(duration.toFixed(2)),
+        status: 400,
+        key_name: keyName,
+        token_suffix: "",
+        error: "content_moderated",
+      });
+      return c.json(openAiError("content_moderated", "content_moderated"), 400);
+    }
     const duration = (Date.now() - start) / 1000;
     await addRequestLog(c.env.DB, {
       ip,

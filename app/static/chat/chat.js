@@ -188,6 +188,13 @@ function extractErrorText(payload) {
   return '';
 }
 
+function extractErrorCode(payload) {
+  if (!payload) return '';
+  if (typeof payload?.code === 'string') return payload.code;
+  if (typeof payload?.error?.code === 'string') return payload.error.code;
+  return '';
+}
+
 function isLikelyNsfwFlowError(message) {
   const text = String(message || '').trim();
   if (!text) return false;
@@ -1611,9 +1618,16 @@ async function generateVideo() {
   const headers = { ...buildApiHeaders(), 'Content-Type': 'application/json' };
   if (!headers.Authorization) return showToast('请先填写 API Key', 'warning');
 
+  const rawVideoLength = Number(q('video-length').value);
+  const normalizedVideoLength = Number.isFinite(rawVideoLength) ? Math.floor(rawVideoLength) : NaN;
+  if (!Number.isFinite(normalizedVideoLength) || normalizedVideoLength < 1 || normalizedVideoLength > 15) {
+    showToast('视频时长需为 1-15 秒', 'warning');
+    return;
+  }
+
   const videoConfig = {
     aspect_ratio: String(q('video-aspect').value || '3:2'),
-    video_length: Number(q('video-length').value || 6),
+    video_length: normalizedVideoLength,
     resolution: String(q('video-resolution').value || 'SD'),
     preset: String(q('video-preset').value || 'custom'),
   };
@@ -1656,7 +1670,12 @@ async function generateVideo() {
       const res = await fetch('/v1/chat/completions', { method: 'POST', headers, body: JSON.stringify(reqBody) });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
+        const errCode = extractErrorCode(data);
         const errMsg = extractErrorText(data) || `HTTP ${res.status}`;
+        if (errCode === 'content_moderated') {
+          showToast('内容审核未通过，无法生成视频', 'error');
+          showNsfwFlowHint(errMsg || 'content_moderated');
+        }
         if (isLikelyNsfwFlowError(errMsg)) showNsfwFlowHint(errMsg);
         throw new Error(errMsg);
       }
@@ -1695,9 +1714,14 @@ async function streamVideo(body, bubbleEl) {
       payload = await res.json();
     } catch (e) {}
     errText = extractErrorText(payload);
+    const errCode = extractErrorCode(payload);
     if (!errText) {
       const t = await res.text().catch(() => '');
       errText = `HTTP ${res.status}: ${t.slice(0, 200)}`;
+    }
+    if (errCode === 'content_moderated') {
+      showToast('内容审核未通过，无法生成视频', 'error');
+      showNsfwFlowHint(errText || 'content_moderated');
     }
     if (isLikelyNsfwFlowError(errText)) showNsfwFlowHint(errText);
     throw new Error(errText);
