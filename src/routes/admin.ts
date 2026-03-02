@@ -64,6 +64,31 @@ function validateTokenType(token_type: string): "sso" | "ssoSuper" {
   return token_type;
 }
 
+async function runTasksSettledWithLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+  if (!items.length) return [];
+  const results: PromiseSettledResult<R>[] = new Array(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.max(1, Math.min(Math.floor(limit || 1), items.length));
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const idx = nextIndex++;
+      if (idx >= items.length) break;
+      try {
+        const value = await fn(items[idx] as T);
+        results[idx] = { status: "fulfilled", value };
+      } catch (reason) {
+        results[idx] = { status: "rejected", reason };
+      }
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 function formatBytes(sizeBytes: number): string {
   const kb = 1024;
   const mb = 1024 * 1024;
@@ -143,6 +168,12 @@ function parseImagineWsFailureStatus(message: string): number {
     if (Number.isFinite(status) && status >= 100 && status <= 599) return status;
   }
   return 500;
+}
+
+function resolveImagineBatchSize(rawValue: unknown, fallback = 6): number {
+  const n = Number(rawValue);
+  if (!Number.isFinite(n)) return Math.max(1, Math.min(6, Math.floor(fallback || 6)));
+  return Math.max(1, Math.min(6, Math.floor(n)));
 }
 
 async function verifyWsApiKeyForImagine(c: any): Promise<boolean> {
@@ -278,6 +309,8 @@ adminRoutes.get("/api/v1/admin/config", requireAdminAuth, async (c) => {
         auto_refresh: Boolean(settings.token.auto_refresh),
         refresh_interval_hours: Number(settings.token.refresh_interval_hours ?? 8),
         fail_threshold: Number(settings.token.fail_threshold ?? 5),
+        nsfw_refresh_concurrency: Number(settings.token.nsfw_refresh_concurrency ?? 10),
+        nsfw_refresh_retries: Number(settings.token.nsfw_refresh_retries ?? 3),
         save_delay_ms: Number(settings.token.save_delay_ms ?? 500),
         reload_interval_sec: Number(settings.token.reload_interval_sec ?? 30),
       },
@@ -293,6 +326,22 @@ adminRoutes.get("/api/v1/admin/config", requireAdminAuth, async (c) => {
         assets_delete_batch_size: Number(settings.performance.assets_delete_batch_size ?? 10),
         admin_assets_batch_size: Number(settings.performance.admin_assets_batch_size ?? 10),
       },
+      public: {
+        enabled: Boolean(settings.public.enabled),
+        cookie_name: String(settings.public.cookie_name ?? "grok2api_public_session"),
+        session_ttl_seconds: Number(settings.public.session_ttl_seconds ?? 1800),
+        hmac_secret: String(settings.public.hmac_secret ?? ""),
+        session_issue_ip_rate_limit_per_min: Number(settings.public.session_issue_ip_rate_limit_per_min ?? 10),
+        ip_rate_limit_per_min: Number(settings.public.ip_rate_limit_per_min ?? 60),
+        session_rate_limit_per_min: Number(settings.public.session_rate_limit_per_min ?? 30),
+        max_messages: Number(settings.public.max_messages ?? 24),
+        max_input_chars: Number(settings.public.max_input_chars ?? 12000),
+        max_input_tokens: Number(settings.public.max_input_tokens ?? 3000),
+        allowed_models: Array.isArray(settings.public.allowed_models) ? settings.public.allowed_models : ["grok-4.20-beta", "grok-4", "grok-4-mini", "grok-3-mini", "grok-3"],
+        captcha_enabled: Boolean(settings.public.captcha_enabled),
+        captcha_secret: String(settings.public.captcha_secret ?? ""),
+        captcha_verify_url: String(settings.public.captcha_verify_url ?? "https://challenges.cloudflare.com/turnstile/v0/siteverify"),
+      },
     });
   } catch (e) {
     return c.json(legacyErr(`Get config failed: ${e instanceof Error ? e.message : String(e)}`), 500);
@@ -307,12 +356,14 @@ adminRoutes.post("/api/v1/admin/config", requireAdminAuth, async (c) => {
     const tokenCfg = (body && typeof body === "object" ? body.token : null) as any;
     const cacheCfg = (body && typeof body === "object" ? body.cache : null) as any;
     const performanceCfg = (body && typeof body === "object" ? body.performance : null) as any;
+    const publicCfg = (body && typeof body === "object" ? body.public : null) as any;
 
     const global_config: any = {};
     const grok_config: any = {};
     const token_config: any = {};
     const cache_config: any = {};
     const performance_config: any = {};
+    const public_config: any = {};
 
     if (appCfg && typeof appCfg === "object") {
       if (typeof appCfg.api_key === "string") grok_config.api_key = appCfg.api_key.trim();
@@ -352,6 +403,10 @@ adminRoutes.post("/api/v1/admin/config", requireAdminAuth, async (c) => {
         token_config.refresh_interval_hours = Math.max(1, Number(tokenCfg.refresh_interval_hours));
       if (Number.isFinite(Number(tokenCfg.fail_threshold)))
         token_config.fail_threshold = Math.max(1, Math.floor(Number(tokenCfg.fail_threshold)));
+      if (Number.isFinite(Number(tokenCfg.nsfw_refresh_concurrency)))
+        token_config.nsfw_refresh_concurrency = Math.max(1, Math.floor(Number(tokenCfg.nsfw_refresh_concurrency)));
+      if (Number.isFinite(Number(tokenCfg.nsfw_refresh_retries)))
+        token_config.nsfw_refresh_retries = Math.max(0, Math.floor(Number(tokenCfg.nsfw_refresh_retries)));
       if (Number.isFinite(Number(tokenCfg.save_delay_ms)))
         token_config.save_delay_ms = Math.max(0, Math.floor(Number(tokenCfg.save_delay_ms)));
       if (Number.isFinite(Number(tokenCfg.reload_interval_sec)))
@@ -377,7 +432,41 @@ adminRoutes.post("/api/v1/admin/config", requireAdminAuth, async (c) => {
       }
     }
 
-    await saveSettings(c.env, { global_config, grok_config, token_config, cache_config, performance_config });
+    if (publicCfg && typeof publicCfg === "object") {
+      if (typeof publicCfg.enabled === "boolean") public_config.enabled = publicCfg.enabled;
+      if (typeof publicCfg.cookie_name === "string") {
+        const v = publicCfg.cookie_name.trim();
+        if (v) public_config.cookie_name = v;
+      }
+      if (typeof publicCfg.hmac_secret === "string") public_config.hmac_secret = publicCfg.hmac_secret;
+      if (Number.isFinite(Number(publicCfg.session_ttl_seconds)))
+        public_config.session_ttl_seconds = Math.max(60, Math.floor(Number(publicCfg.session_ttl_seconds)));
+      if (Number.isFinite(Number(publicCfg.session_issue_ip_rate_limit_per_min)))
+        public_config.session_issue_ip_rate_limit_per_min = Math.max(1, Math.floor(Number(publicCfg.session_issue_ip_rate_limit_per_min)));
+      if (Number.isFinite(Number(publicCfg.ip_rate_limit_per_min)))
+        public_config.ip_rate_limit_per_min = Math.max(1, Math.floor(Number(publicCfg.ip_rate_limit_per_min)));
+      if (Number.isFinite(Number(publicCfg.session_rate_limit_per_min)))
+        public_config.session_rate_limit_per_min = Math.max(1, Math.floor(Number(publicCfg.session_rate_limit_per_min)));
+      if (Number.isFinite(Number(publicCfg.max_messages)))
+        public_config.max_messages = Math.max(1, Math.floor(Number(publicCfg.max_messages)));
+      if (Number.isFinite(Number(publicCfg.max_input_chars)))
+        public_config.max_input_chars = Math.max(1, Math.floor(Number(publicCfg.max_input_chars)));
+      if (Number.isFinite(Number(publicCfg.max_input_tokens)))
+        public_config.max_input_tokens = Math.max(1, Math.floor(Number(publicCfg.max_input_tokens)));
+      if (Array.isArray(publicCfg.allowed_models)) {
+        public_config.allowed_models = publicCfg.allowed_models
+          .map((x: any) => String(x ?? "").trim())
+          .filter(Boolean);
+      }
+      if (typeof publicCfg.captcha_enabled === "boolean") public_config.captcha_enabled = publicCfg.captcha_enabled;
+      if (typeof publicCfg.captcha_secret === "string") public_config.captcha_secret = publicCfg.captcha_secret;
+      if (typeof publicCfg.captcha_verify_url === "string") {
+        const u = publicCfg.captcha_verify_url.trim();
+        if (u) public_config.captcha_verify_url = u;
+      }
+    }
+
+    await saveSettings(c.env, { global_config, grok_config, token_config, cache_config, performance_config, public_config });
     return c.json(legacyOk({ message: "配置已更新" }));
   } catch (e) {
     return c.json(legacyErr(`Update config failed: ${e instanceof Error ? e.message : String(e)}`), 500);
@@ -434,7 +523,7 @@ adminRoutes.get("/api/v1/admin/imagine/ws", async (c) => {
     }
   };
 
-  const startRun = (prompt: string, aspectRatio: string): void => {
+  const startRun = (prompt: string, aspectRatio: string, batchSize: number): void => {
     runToken += 1;
     const localToken = runToken;
     running = true;
@@ -447,6 +536,7 @@ adminRoutes.get("/api/v1/admin/imagine/ws", async (c) => {
       status: "running",
       prompt,
       aspect_ratio: aspectRatio,
+      batch_size: batchSize,
       run_id: runId,
     });
 
@@ -471,7 +561,7 @@ adminRoutes.get("/api/v1/admin/imagine/ws", async (c) => {
           const startAt = Date.now();
           const urls = await generateImagineWs({
             prompt,
-            n: 6,
+            n: batchSize,
             cookie,
             settings: settings.grok,
             aspectRatio,
@@ -494,6 +584,7 @@ adminRoutes.get("/api/v1/admin/imagine/ws", async (c) => {
               created_at: Date.now(),
               elapsed_ms: elapsedMs,
               aspect_ratio: aspectRatio,
+              batch_size: batchSize,
               run_id: runId,
             });
             if (!ok) {
@@ -561,8 +652,9 @@ adminRoutes.get("/api/v1/admin/imagine/ws", async (c) => {
         return;
       }
       const ratio = resolveAspectRatio(String(payload.aspect_ratio ?? "2:3").trim());
+      const batchSize = resolveImagineBatchSize(payload.batch_size, 6);
       stopRun(false);
-      startRun(prompt, ratio);
+      startRun(prompt, ratio, batchSize);
       return;
     }
 
@@ -758,6 +850,102 @@ adminRoutes.post("/api/v1/admin/tokens/refresh", requireAdminAuth, async (c) => 
     return c.json(legacyOk({ results }));
   } catch (e) {
     return c.json(legacyErr(`Refresh failed: ${e instanceof Error ? e.message : String(e)}`), 500);
+  }
+});
+
+adminRoutes.post("/api/v1/admin/tokens/nsfw/refresh", requireAdminAuth, async (c) => {
+  try {
+    const body = (await c.req.json()) as any;
+    const all = Boolean(body?.all);
+    const requested: string[] = [];
+    if (typeof body?.token === "string") requested.push(body.token);
+    if (Array.isArray(body?.tokens)) {
+      requested.push(...body.tokens.filter((x: any) => typeof x === "string"));
+    }
+
+    let targets: string[] = [...new Set(requested.map((t) => normalizeSsoToken(t)).filter(Boolean))] as string[];
+    if (all || !targets.length) {
+      const rows = await listTokens(c.env.DB);
+      targets = [...new Set(rows.map((r) => normalizeSsoToken(r.token)).filter(Boolean))] as string[];
+    }
+
+    if (!targets.length) {
+      return c.json(legacyErr("No tokens provided"), 400);
+    }
+
+    const settings = await getSettings(c.env);
+    const cf = normalizeCfCookie(settings.grok.cf_clearance ?? "");
+    const concurrency = Math.max(1, Math.min(20, Math.floor(Number(settings.token.nsfw_refresh_concurrency ?? 10) || 10)));
+    const retries = Math.max(0, Math.min(10, Math.floor(Number(settings.token.nsfw_refresh_retries ?? 3) || 3)));
+
+    const refreshOne = async (token: string): Promise<{ token: string; ok: boolean; reason?: string }> => {
+      const modelsToTry = ["grok-4", "grok-4.20-beta", "grok-3"];
+      let lastReason = "rate_limit_unavailable";
+      for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+          const cookie = cf ? `sso-rw=${token};sso=${token};${cf}` : `sso-rw=${token};sso=${token}`;
+          let success = false;
+          for (const model of modelsToTry) {
+            const r = await checkRateLimits(cookie, settings.grok, model);
+            const remaining = Number((r as any)?.remainingTokens);
+            if (Number.isFinite(remaining)) {
+              await updateTokenLimits(c.env.DB, token, { remaining_queries: Math.max(-1, Math.floor(remaining)) });
+              success = true;
+              break;
+            }
+          }
+          if (success) {
+            return { token, ok: true };
+          }
+          lastReason = "rate_limit_unavailable";
+        } catch (e) {
+          lastReason = e instanceof Error ? e.message : String(e);
+        }
+
+        if (attempt < retries) {
+          await new Promise((res) => setTimeout(res, 100 * (attempt + 1)));
+        }
+      }
+      return { token, ok: false, ...(lastReason ? { reason: lastReason } : {}) };
+    };
+
+    const settled = await runTasksSettledWithLimit(targets, concurrency, refreshOne);
+    const details: Array<{ token: string; success: boolean; reason?: string }> = [];
+    let success = 0;
+    let failed = 0;
+
+    for (let i = 0; i < settled.length; i++) {
+      const token = targets[i] as string;
+      const item = settled[i]!;
+      if (item.status === "fulfilled") {
+        const value = item.value;
+        details.push({ token: `sso=${value.token}`, success: value.ok, ...(value.reason ? { reason: value.reason } : {}) });
+        if (value.ok) success += 1;
+        else failed += 1;
+      } else {
+        const reason = item.reason instanceof Error ? item.reason.message : String(item.reason ?? "refresh_error");
+        details.push({ token: `sso=${token}`, success: false, reason });
+        failed += 1;
+      }
+    }
+
+    const results = Object.fromEntries(details.map((d) => [d.token, d.success]));
+    return c.json({
+      success: true,
+      triggered: targets.length,
+      results,
+      summary: {
+        total: targets.length,
+        success,
+        failed,
+        invalidated: 0,
+        concurrency,
+        retries,
+      },
+      details,
+    });
+  } catch (e) {
+    return c.json(legacyErr(`NSFW refresh failed: ${e instanceof Error ? e.message : String(e)}`), 500);
   }
 });
 

@@ -38,6 +38,8 @@ export interface TokenSettings {
   fail_threshold?: number;
   save_delay_ms?: number;
   reload_interval_sec?: number;
+  nsfw_refresh_concurrency?: number;
+  nsfw_refresh_retries?: number;
 }
 
 export interface CacheSettings {
@@ -70,6 +72,23 @@ export interface RegisterSettings {
   max_runtime_minutes?: number;
 }
 
+export interface PublicSettings {
+  enabled?: boolean;
+  cookie_name?: string;
+  session_ttl_seconds?: number;
+  hmac_secret?: string;
+  session_issue_ip_rate_limit_per_min?: number;
+  ip_rate_limit_per_min?: number;
+  session_rate_limit_per_min?: number;
+  max_messages?: number;
+  max_input_chars?: number;
+  max_input_tokens?: number;
+  allowed_models?: string[];
+  captcha_enabled?: boolean;
+  captcha_secret?: string;
+  captcha_verify_url?: string;
+}
+
 export interface SettingsBundle {
   global: Required<GlobalSettings>;
   grok: Required<GrokSettings>;
@@ -77,6 +96,7 @@ export interface SettingsBundle {
   cache: Required<CacheSettings>;
   performance: Required<PerformanceSettings>;
   register: Required<RegisterSettings>;
+  public: Required<PublicSettings>;
 }
 
 const DEFAULTS: SettingsBundle = {
@@ -114,6 +134,8 @@ const DEFAULTS: SettingsBundle = {
     fail_threshold: 5,
     save_delay_ms: 500,
     reload_interval_sec: 30,
+    nsfw_refresh_concurrency: 10,
+    nsfw_refresh_retries: 3,
   },
   cache: {
     enable_auto_clean: true,
@@ -141,6 +163,22 @@ const DEFAULTS: SettingsBundle = {
     solver_debug: false,
     max_errors: 0,
     max_runtime_minutes: 0,
+  },
+  public: {
+    enabled: true,
+    cookie_name: "grok2api_public_session",
+    session_ttl_seconds: 1800,
+    hmac_secret: "",
+    session_issue_ip_rate_limit_per_min: 10,
+    ip_rate_limit_per_min: 60,
+    session_rate_limit_per_min: 30,
+    max_messages: 24,
+    max_input_chars: 12000,
+    max_input_tokens: 3000,
+    allowed_models: ["grok-4.20-beta", "grok-4", "grok-4-mini", "grok-3-mini", "grok-3"],
+    captcha_enabled: false,
+    captcha_secret: "",
+    captcha_verify_url: "https://challenges.cloudflare.com/turnstile/v0/siteverify",
   },
 };
 
@@ -216,6 +254,11 @@ export async function getSettings(env: Env): Promise<SettingsBundle> {
     "SELECT value FROM settings WHERE key = ?",
     ["register"],
   );
+  const publicRow = await dbFirst<{ value: string }>(
+    env.DB,
+    "SELECT value FROM settings WHERE key = ?",
+    ["public"],
+  );
 
   const globalCfg = globalRow?.value
     ? safeParseJson<GlobalSettings>(globalRow.value, DEFAULTS.global)
@@ -235,6 +278,9 @@ export async function getSettings(env: Env): Promise<SettingsBundle> {
   const registerCfg = registerRow?.value
     ? safeParseJson<RegisterSettings>(registerRow.value, DEFAULTS.register)
     : DEFAULTS.register;
+  const publicCfg = publicRow?.value
+    ? safeParseJson<PublicSettings>(publicRow.value, DEFAULTS.public)
+    : DEFAULTS.public;
 
   const mergedGrok = {
     ...DEFAULTS.grok,
@@ -252,6 +298,7 @@ export async function getSettings(env: Env): Promise<SettingsBundle> {
     cache: { ...DEFAULTS.cache, ...cacheCfg },
     performance: { ...DEFAULTS.performance, ...performanceCfg },
     register: { ...DEFAULTS.register, ...registerCfg },
+    public: { ...DEFAULTS.public, ...publicCfg },
   };
 }
 
@@ -264,6 +311,7 @@ export async function saveSettings(
     cache_config?: CacheSettings;
     performance_config?: PerformanceSettings;
     register_config?: RegisterSettings;
+    public_config?: PublicSettings;
   },
 ): Promise<void> {
   const now = nowMs();
@@ -280,6 +328,7 @@ export async function saveSettings(
   const nextCache: CacheSettings = { ...current.cache, ...(updates.cache_config ?? {}) };
   const nextPerformance: PerformanceSettings = { ...current.performance, ...(updates.performance_config ?? {}) };
   const nextRegister: RegisterSettings = { ...current.register, ...(updates.register_config ?? {}) };
+  const nextPublic: PublicSettings = { ...current.public, ...(updates.public_config ?? {}) };
 
   await dbRun(
     env.DB,
@@ -310,6 +359,11 @@ export async function saveSettings(
     env.DB,
     "INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
     ["register", JSON.stringify(nextRegister), now],
+  );
+  await dbRun(
+    env.DB,
+    "INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+    ["public", JSON.stringify(nextPublic), now],
   );
 }
 

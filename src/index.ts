@@ -3,6 +3,7 @@ import type { Env } from "./env";
 import { openAiRoutes } from "./routes/openai";
 import { mediaRoutes } from "./routes/media";
 import { adminRoutes } from "./routes/admin";
+import { publicRoutes } from "./routes/public";
 import { runKvDailyClear } from "./kv/cleanup";
 
 const app = new Hono<{ Bindings: Env }>();
@@ -84,6 +85,7 @@ app.onError((err, c) => {
 app.route("/v1", openAiRoutes);
 app.route("/", mediaRoutes);
 app.route("/", adminRoutes);
+app.route("/", publicRoutes);
 
 // Backward-compatible local-cache viewer URLs used by the multi-page admin UI.
 // In Workers we serve cache via /images/*, so redirect /v1/files/* to /images/*.

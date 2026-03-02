@@ -1143,9 +1143,456 @@ function resolveImageResponseFormatByMethodOrError(
   return parseResponseFormatOrError(raw, effectiveDefault);
 }
 
+function newResponseId(): string {
+  return `resp_${crypto.randomUUID().replaceAll("-", "").slice(0, 24)}`;
+}
+
+function newResponseMessageId(): string {
+  return `msg_${crypto.randomUUID().replaceAll("-", "").slice(0, 24)}`;
+}
+
+function responsesSse(data: unknown): string {
+  return `data: ${JSON.stringify(data)}\n\n`;
+}
+
+function responsesParseReasoningEffort(reasoning: unknown): string | undefined {
+  if (!reasoning || typeof reasoning !== "object" || Array.isArray(reasoning)) return undefined;
+  const src = reasoning as Record<string, unknown>;
+  const effort = String(src.effort ?? src.reasoning_effort ?? "").trim();
+  return effort || undefined;
+}
+
+function responsesCoerceContent(content: unknown): unknown {
+  if (content === null || content === undefined) return "";
+  if (typeof content === "string") return content;
+
+  if (Array.isArray(content)) {
+    const blocks: Array<Record<string, unknown>> = [];
+    for (const item of content) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+      const block = item as Record<string, unknown>;
+      const type = String(block.type ?? "").trim().toLowerCase();
+
+      if (type === "input_text" || type === "output_text" || type === "text") {
+        blocks.push({ type: "text", text: String(block.text ?? "") });
+        continue;
+      }
+
+      if (type === "input_image" || type === "image" || type === "image_url" || type === "output_image") {
+        const imageUrlRaw = block.image_url;
+        if (typeof imageUrlRaw === "string" && imageUrlRaw.trim()) {
+          blocks.push({ type: "image_url", image_url: { url: imageUrlRaw.trim() } });
+          continue;
+        }
+        if (imageUrlRaw && typeof imageUrlRaw === "object" && !Array.isArray(imageUrlRaw)) {
+          const imageObj = imageUrlRaw as Record<string, unknown>;
+          const url = String(imageObj.url ?? "").trim();
+          if (url) {
+            const payload: Record<string, unknown> = { url };
+            const detail = String(imageObj.detail ?? "").trim();
+            if (detail) payload.detail = detail;
+            blocks.push({ type: "image_url", image_url: payload });
+          }
+          continue;
+        }
+        const topLevelUrl = String(block.url ?? "").trim();
+        if (topLevelUrl) {
+          blocks.push({ type: "image_url", image_url: { url: topLevelUrl } });
+        }
+        continue;
+      }
+
+      if (type === "input_file" || type === "file") {
+        const fileObj = block.file && typeof block.file === "object" && !Array.isArray(block.file)
+          ? (block.file as Record<string, unknown>)
+          : {};
+        const fileData = String(fileObj.file_data ?? block.file_data ?? "").trim();
+        const fileId = String(fileObj.file_id ?? block.file_id ?? "").trim();
+        const payload: Record<string, unknown> = {};
+        if (fileData) payload.file_data = fileData;
+        if (fileId) payload.file_id = fileId;
+        if (Object.keys(payload).length) blocks.push({ type: "file", file: payload });
+        continue;
+      }
+
+      if (type === "input_audio" || type === "audio") {
+        const audioObj = block.input_audio && typeof block.input_audio === "object" && !Array.isArray(block.input_audio)
+          ? (block.input_audio as Record<string, unknown>)
+          : block.audio && typeof block.audio === "object" && !Array.isArray(block.audio)
+            ? (block.audio as Record<string, unknown>)
+            : {};
+        const data = String(audioObj.data ?? block.data ?? "").trim();
+        if (data) blocks.push({ type: "input_audio", input_audio: { data } });
+        continue;
+      }
+    }
+
+    if (!blocks.length) return "";
+    if (blocks.length === 1 && blocks[0]?.type === "text") return String(blocks[0]?.text ?? "");
+    return blocks;
+  }
+
+  if (typeof content === "object") return responsesCoerceContent([content]);
+  return String(content);
+}
+
+function responsesInputToMessages(input: unknown, instructions?: string): Array<Record<string, unknown>> {
+  const messages: Array<Record<string, unknown>> = [];
+  const pendingUserBlocks: Array<Record<string, unknown>> = [];
+
+  const flushPending = () => {
+    if (!pendingUserBlocks.length) return;
+    if (pendingUserBlocks.length === 1 && pendingUserBlocks[0]?.type === "text") {
+      messages.push({ role: "user", content: String(pendingUserBlocks[0]?.text ?? "") });
+    } else {
+      messages.push({ role: "user", content: pendingUserBlocks.slice() });
+    }
+    pendingUserBlocks.length = 0;
+  };
+
+  const pushCoercedToPending = (coerced: unknown) => {
+    if (Array.isArray(coerced)) {
+      for (const item of coerced) {
+        if (item && typeof item === "object" && !Array.isArray(item)) {
+          pendingUserBlocks.push(item as Record<string, unknown>);
+        }
+      }
+      return;
+    }
+    if (typeof coerced === "string") {
+      if (coerced) pendingUserBlocks.push({ type: "text", text: coerced });
+      return;
+    }
+    if (coerced !== null && coerced !== undefined) {
+      pendingUserBlocks.push({ type: "text", text: String(coerced) });
+    }
+  };
+
+  const processItem = (item: unknown) => {
+    if (typeof item === "string") {
+      if (item) pendingUserBlocks.push({ type: "text", text: item });
+      return;
+    }
+
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      if (item !== null && item !== undefined) {
+        pendingUserBlocks.push({ type: "text", text: String(item) });
+      }
+      return;
+    }
+
+    const obj = item as Record<string, unknown>;
+    const role = String(obj.role ?? "").trim();
+    if (role && Object.prototype.hasOwnProperty.call(obj, "content")) {
+      flushPending();
+      messages.push({ role, content: responsesCoerceContent(obj.content) });
+      return;
+    }
+
+    const itemType = String(obj.type ?? "").trim().toLowerCase();
+    if (
+      itemType === "tool_output" ||
+      itemType === "function_call_output" ||
+      itemType === "tool_call_output" ||
+      itemType === "input_tool_output"
+    ) {
+      flushPending();
+      const callId =
+        String(obj.call_id ?? obj.tool_call_id ?? obj.id ?? "").trim() ||
+        `call_${crypto.randomUUID().replaceAll("-", "").slice(0, 24)}`;
+      const output = obj.output ?? obj.content ?? "";
+      messages.push({
+        role: "tool",
+        tool_call_id: callId,
+        content: typeof output === "string" ? output : JSON.stringify(output),
+      });
+      return;
+    }
+
+    pushCoercedToPending(responsesCoerceContent(obj));
+  };
+
+  if (Array.isArray(input)) {
+    for (const item of input) processItem(item);
+  } else if (input && typeof input === "object" && !Array.isArray(input)) {
+    processItem(input);
+  } else if (input !== null && input !== undefined) {
+    processItem(String(input));
+  }
+
+  flushPending();
+
+  if (instructions && instructions.trim()) {
+    messages.unshift({ role: "system", content: instructions.trim() });
+  }
+
+  if (!messages.length) messages.push({ role: "user", content: "" });
+  return messages;
+}
+
+function responsesUsageFromChat(json: Record<string, unknown>): {
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+} {
+  const usage = json.usage && typeof json.usage === "object" && !Array.isArray(json.usage)
+    ? (json.usage as Record<string, unknown>)
+    : {};
+  const input = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0);
+  const output = Number(usage.completion_tokens ?? usage.output_tokens ?? 0);
+  const totalRaw = Number(usage.total_tokens ?? input + output);
+  const safeInput = Number.isFinite(input) && input > 0 ? Math.floor(input) : 0;
+  const safeOutput = Number.isFinite(output) && output > 0 ? Math.floor(output) : 0;
+  const safeTotal = Number.isFinite(totalRaw) && totalRaw > 0 ? Math.floor(totalRaw) : safeInput + safeOutput;
+  return {
+    input_tokens: safeInput,
+    output_tokens: safeOutput,
+    total_tokens: safeTotal,
+  };
+}
+
+function responsesBuildObject(args: {
+  responseId: string;
+  model: string;
+  text: string;
+  usage: { input_tokens: number; output_tokens: number; total_tokens: number };
+  metadata: Record<string, unknown>;
+  user: string | null;
+  previousResponseId: string | null;
+  temperature?: number;
+  topP?: number;
+  maxOutputTokens?: number;
+  tools?: unknown;
+  toolChoice?: unknown;
+  reasoningEffort?: string;
+}): Record<string, unknown> {
+  return {
+    id: args.responseId,
+    object: "response",
+    created_at: Math.floor(Date.now() / 1000),
+    status: "completed",
+    error: null,
+    incomplete_details: null,
+    instructions: null,
+    max_output_tokens: args.maxOutputTokens ?? null,
+    model: args.model,
+    output: [
+      {
+        id: newResponseMessageId(),
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: args.text, annotations: [] }],
+      },
+    ],
+    parallel_tool_calls: true,
+    previous_response_id: args.previousResponseId,
+    reasoning: { effort: args.reasoningEffort ?? null, summary: null },
+    store: true,
+    temperature: args.temperature ?? null,
+    text: { format: { type: "text" } },
+    tool_choice: args.toolChoice ?? "auto",
+    tools: Array.isArray(args.tools) ? args.tools : [],
+    top_p: args.topP ?? null,
+    truncation: "disabled",
+    usage: args.usage,
+    user: args.user,
+    metadata: args.metadata,
+  };
+}
+
+function createResponsesStreamFromChatSse(args: {
+  upstream: Response;
+  model: string;
+  metadata: Record<string, unknown>;
+  user: string | null;
+  previousResponseId: string | null;
+  temperature?: number;
+  topP?: number;
+  maxOutputTokens?: number;
+  tools?: unknown;
+  toolChoice?: unknown;
+  reasoningEffort?: string;
+  onFinish?: (result: { status: number; duration: number }) => Promise<void> | void;
+}): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const startedAt = Date.now();
+      const responseId = newResponseId();
+      const createdAt = Math.floor(Date.now() / 1000);
+      const chunks: string[] = [];
+
+      controller.enqueue(
+        encoder.encode(
+          responsesSse({
+            type: "response.created",
+            response: {
+              id: responseId,
+              object: "response",
+              created_at: createdAt,
+              status: "in_progress",
+              model: args.model,
+              output: [],
+            },
+          }),
+        ),
+      );
+
+      const body = args.upstream.body;
+      if (!body) {
+        controller.enqueue(
+          encoder.encode(
+            responsesSse({
+              type: "response.error",
+              response_id: responseId,
+              error: { message: "Empty upstream body", type: "server_error" },
+            }),
+          ),
+        );
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        if (args.onFinish) {
+          await args.onFinish({ status: 500, duration: (Date.now() - startedAt) / 1000 });
+        }
+        controller.close();
+        return;
+      }
+
+      const reader = body.getReader();
+      let buffer = "";
+
+      const finish = () => {
+        const fullText = chunks.join("");
+        controller.enqueue(
+          encoder.encode(
+            responsesSse({
+              type: "response.output_text.done",
+              response_id: responseId,
+              output_index: 0,
+              content_index: 0,
+              text: fullText,
+            }),
+          ),
+        );
+
+        const completed = responsesBuildObject({
+          responseId,
+          model: args.model,
+          text: fullText,
+          usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+          metadata: args.metadata,
+          user: args.user,
+          previousResponseId: args.previousResponseId,
+          ...(args.temperature !== undefined ? { temperature: args.temperature } : {}),
+          ...(args.topP !== undefined ? { topP: args.topP } : {}),
+          ...(args.maxOutputTokens !== undefined ? { maxOutputTokens: args.maxOutputTokens } : {}),
+          ...(args.tools !== undefined ? { tools: args.tools } : {}),
+          ...(args.toolChoice !== undefined ? { toolChoice: args.toolChoice } : {}),
+          ...(args.reasoningEffort ? { reasoningEffort: args.reasoningEffort } : {}),
+        });
+        completed.created_at = createdAt;
+
+        controller.enqueue(encoder.encode(responsesSse({ type: "response.completed", response: completed })));
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      };
+
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (!value) continue;
+          buffer += decoder.decode(value, { stream: true });
+
+          const blocks = buffer.split("\n\n");
+          buffer = blocks.pop() ?? "";
+
+          for (const block of blocks) {
+            const lines = block
+              .split("\n")
+              .map((line) => line.trim())
+              .filter(Boolean);
+            for (const line of lines) {
+              if (!line.startsWith("data:")) continue;
+              const payload = line.slice(5).trim();
+              if (!payload) continue;
+              if (payload === "[DONE]") {
+                finish();
+                if (args.onFinish) {
+                  await args.onFinish({ status: 200, duration: (Date.now() - startedAt) / 1000 });
+                }
+                controller.close();
+                return;
+              }
+
+              let json: Record<string, unknown>;
+              try {
+                json = JSON.parse(payload) as Record<string, unknown>;
+              } catch {
+                continue;
+              }
+
+              const choices = Array.isArray(json.choices) ? (json.choices as unknown[]) : [];
+              if (!choices.length || !choices[0] || typeof choices[0] !== "object") continue;
+              const choice = choices[0] as Record<string, unknown>;
+              const delta = choice.delta;
+              if (!delta || typeof delta !== "object" || Array.isArray(delta)) continue;
+              const content = (delta as Record<string, unknown>).content;
+              if (typeof content !== "string" || !content) continue;
+
+              chunks.push(content);
+              controller.enqueue(
+                encoder.encode(
+                  responsesSse({
+                    type: "response.output_text.delta",
+                    response_id: responseId,
+                    output_index: 0,
+                    content_index: 0,
+                    delta: content,
+                  }),
+                ),
+              );
+            }
+          }
+        }
+
+        finish();
+        if (args.onFinish) {
+          await args.onFinish({ status: 200, duration: (Date.now() - startedAt) / 1000 });
+        }
+        controller.close();
+      } catch (e) {
+        controller.enqueue(
+          encoder.encode(
+            responsesSse({
+              type: "response.error",
+              response_id: responseId,
+              error: {
+                message: e instanceof Error ? e.message : String(e),
+                type: "server_error",
+              },
+            }),
+          ),
+        );
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        if (args.onFinish) {
+          await args.onFinish({ status: 500, duration: (Date.now() - startedAt) / 1000 });
+        }
+        controller.close();
+      } finally {
+        try {
+          reader.releaseLock();
+        } catch {
+          // ignore
+        }
+      }
+    },
+  });
+}
+
 openAiRoutes.get("/models", async (c) => {
   const ts = Math.floor(Date.now() / 1000);
-  const data = Object.entries(MODEL_CONFIG).map(([id, cfg]) => ({
+  const data = Object.entries(MODEL_CONFIG).map(([id, cfg]: [string, (typeof MODEL_CONFIG)[string]]) => ({
     id,
     object: "model",
     created: ts,
@@ -1237,7 +1684,7 @@ openAiRoutes.post("/chat/completions", async (c) => {
       kind: quotaKind as any,
       ...(cfg.is_image_model ? { imageCount: 2 } : {}),
     });
-    if (!quota.ok) return quota.resp;
+    if (quota.ok === false) return quota.resp;
 
     for (let attempt = 0; attempt < maxRetry; attempt++) {
       const chosen = await selectBestToken(c.env.DB, requestedModel);
@@ -1253,8 +1700,9 @@ openAiRoutes.post("/chat/completions", async (c) => {
 
       try {
         const uploads = await mapLimit(imgInputs, 5, (u) => uploadImage(u, cookie, settingsBundle.grok));
-        const imgIds = uploads.map((u) => u.fileId).filter(Boolean);
-        const imgUris = uploads.map((u) => u.fileUri).filter(Boolean);
+        const uploadedRows = uploads as Array<{ fileId?: string; fileUri?: string }>;
+        const imgIds = uploadedRows.map((u) => u.fileId).filter(Boolean) as string[];
+        const imgUris = uploadedRows.map((u) => u.fileUri).filter(Boolean) as string[];
 
         let postId: string | undefined;
         if (isVideoModel) {
@@ -1385,6 +1833,265 @@ openAiRoutes.post("/chat/completions", async (c) => {
   }
 });
 
+openAiRoutes.post("/responses", async (c) => {
+  const start = Date.now();
+  const ip = getClientIp(c.req.raw);
+  const keyName = c.get("apiAuth").name ?? "Unknown";
+  const origin = new URL(c.req.url).origin;
+
+  let requestedModel = "";
+  try {
+    const body = (await c.req.json()) as {
+      model?: unknown;
+      input?: unknown;
+      instructions?: unknown;
+      stream?: unknown;
+      tools?: unknown;
+      tool_choice?: unknown;
+      reasoning?: unknown;
+      max_output_tokens?: unknown;
+      temperature?: unknown;
+      top_p?: unknown;
+      user?: unknown;
+      metadata?: unknown;
+      previous_response_id?: unknown;
+    };
+
+    requestedModel = String(body.model ?? "").trim();
+    if (!requestedModel) return c.json(openAiError("Missing 'model'", "missing_model"), 400);
+    if (body.input === undefined || body.input === null) {
+      return c.json(openAiError("Missing 'input'", "missing_input"), 400);
+    }
+    if (!isValidModel(requestedModel)) {
+      return c.json(openAiError(`Model '${requestedModel}' not supported`, "model_not_supported"), 400);
+    }
+
+    const messages = responsesInputToMessages(
+      body.input,
+      typeof body.instructions === "string" ? body.instructions : undefined,
+    );
+
+    const stream = toBool(body.stream);
+    const metadata =
+      body.metadata && typeof body.metadata === "object" && !Array.isArray(body.metadata)
+        ? (body.metadata as Record<string, unknown>)
+        : {};
+    const user = typeof body.user === "string" && body.user.trim() ? body.user.trim() : null;
+    const previousResponseId =
+      typeof body.previous_response_id === "string" && body.previous_response_id.trim()
+        ? body.previous_response_id.trim()
+        : null;
+    const reasoningEffort = responsesParseReasoningEffort(body.reasoning);
+    const temperatureValue = Number(body.temperature);
+    const topPValue = Number(body.top_p);
+    const maxOutputTokensValue = Number(body.max_output_tokens);
+
+    const settingsBundle = await getSettings(c.env);
+    const cfg = MODEL_CONFIG[requestedModel]!;
+
+    const retryCodes = Array.isArray(settingsBundle.grok.retry_status_codes)
+      ? settingsBundle.grok.retry_status_codes
+      : [401, 429];
+
+    const quotaKind = cfg.is_video_model ? "video" : cfg.is_image_model ? "image" : "chat";
+    const quota = await enforceQuota({
+      env: c.env,
+      apiAuth: c.get("apiAuth"),
+      model: requestedModel,
+      kind: quotaKind as any,
+      ...(cfg.is_image_model ? { imageCount: 2 } : {}),
+    });
+    if (quota.ok === false) return quota.resp;
+
+    const maxRetry = 3;
+    let lastErr: string | null = null;
+
+    for (let attempt = 0; attempt < maxRetry; attempt++) {
+      const chosen = await selectBestToken(c.env.DB, requestedModel);
+      if (!chosen) return c.json(openAiError("No available token", "NO_AVAILABLE_TOKEN"), 503);
+
+      const jwt = chosen.token;
+      const cf = normalizeCfCookie(settingsBundle.grok.cf_clearance ?? "");
+      const cookie = cf ? `sso-rw=${jwt};sso=${jwt};${cf}` : `sso-rw=${jwt};sso=${jwt}`;
+
+      const { content, images } = extractContent(messages as any);
+      const isVideoModel = Boolean(cfg.is_video_model);
+      const imgInputs = isVideoModel && images.length > 1 ? images.slice(0, 1) : images;
+
+      try {
+        const uploads = await mapLimit(imgInputs, 5, (u) => uploadImage(u, cookie, settingsBundle.grok));
+        const uploadedRows = uploads as Array<{ fileId?: string; fileUri?: string }>;
+        const imgIds = uploadedRows.map((u) => u.fileId).filter(Boolean) as string[];
+        const imgUris = uploadedRows.map((u) => u.fileUri).filter(Boolean) as string[];
+
+        let postId: string | undefined;
+        if (isVideoModel) {
+          if (imgUris.length) {
+            const post = await createPost(imgUris[0]!, cookie, settingsBundle.grok);
+            postId = post.postId || undefined;
+          } else {
+            const post = await createMediaPost(
+              { mediaType: "MEDIA_POST_TYPE_VIDEO", prompt: content },
+              cookie,
+              settingsBundle.grok,
+            );
+            postId = post.postId || undefined;
+          }
+        }
+
+        const { payload, referer } = buildConversationPayload({
+          requestModel: requestedModel,
+          content,
+          imgIds,
+          imgUris,
+          ...(postId ? { postId } : {}),
+          settings: settingsBundle.grok,
+        });
+
+        const upstream = await sendConversationRequest({
+          payload,
+          cookie,
+          settings: settingsBundle.grok,
+          ...(referer ? { referer } : {}),
+        });
+
+        if (!upstream.ok) {
+          const txt = await upstream.text().catch(() => "");
+          lastErr = `Upstream ${upstream.status}: ${txt.slice(0, 200)}`;
+          await recordTokenFailure(c.env.DB, jwt, upstream.status, txt.slice(0, 200));
+          await applyCooldown(c.env.DB, jwt, upstream.status);
+          if (retryCodes.includes(upstream.status) && attempt < maxRetry - 1) continue;
+          break;
+        }
+
+        const responseId = newResponseId();
+
+        if (stream) {
+          const chatSse = createOpenAiStreamFromGrokNdjson(upstream, {
+            cookie,
+            settings: settingsBundle.grok,
+            global: settingsBundle.global,
+            origin,
+            requestedModel,
+          });
+
+          const responseSse = createResponsesStreamFromChatSse({
+            upstream: new Response(chatSse),
+            model: requestedModel,
+            metadata,
+            user,
+            previousResponseId,
+            ...(Number.isFinite(temperatureValue) ? { temperature: temperatureValue } : {}),
+            ...(Number.isFinite(topPValue) ? { topP: topPValue } : {}),
+            ...(Number.isFinite(maxOutputTokensValue) ? { maxOutputTokens: Math.max(1, Math.floor(maxOutputTokensValue)) } : {}),
+            ...(body.tools !== undefined ? { tools: body.tools } : {}),
+            ...(body.tool_choice !== undefined ? { toolChoice: body.tool_choice } : {}),
+            ...(reasoningEffort ? { reasoningEffort } : {}),
+            onFinish: async ({ status, duration }) => {
+              await addRequestLog(c.env.DB, {
+                ip,
+                model: requestedModel,
+                duration: Number(duration.toFixed(2)),
+                status,
+                key_name: keyName,
+                token_suffix: jwt.slice(-6),
+                error: status === 200 ? "" : "stream_error",
+              });
+            },
+          });
+
+          return new Response(responseSse, {
+            status: 200,
+            headers: {
+              "Content-Type": "text/event-stream; charset=utf-8",
+              "Cache-Control": "no-cache",
+              Connection: "keep-alive",
+              "X-Accel-Buffering": "no",
+              "Access-Control-Allow-Origin": "*",
+            },
+          });
+        }
+
+        const chatJson = await parseOpenAiFromGrokNdjson(upstream, {
+          cookie,
+          settings: settingsBundle.grok,
+          global: settingsBundle.global,
+          origin,
+          requestedModel,
+        });
+
+        const contentText = String(
+          (
+            (chatJson.choices as Array<Record<string, unknown>> | undefined)?.[0]?.message as
+              | Record<string, unknown>
+              | undefined
+          )?.content ?? "",
+        );
+
+        const responseJson = responsesBuildObject({
+          responseId,
+          model: requestedModel,
+          text: contentText,
+          usage: responsesUsageFromChat(chatJson),
+          metadata,
+          user,
+          previousResponseId,
+          ...(Number.isFinite(temperatureValue) ? { temperature: temperatureValue } : {}),
+          ...(Number.isFinite(topPValue) ? { topP: topPValue } : {}),
+          ...(Number.isFinite(maxOutputTokensValue) ? { maxOutputTokens: Math.max(1, Math.floor(maxOutputTokensValue)) } : {}),
+          ...(body.tools !== undefined ? { tools: body.tools } : {}),
+          ...(body.tool_choice !== undefined ? { toolChoice: body.tool_choice } : {}),
+          ...(reasoningEffort ? { reasoningEffort } : {}),
+        });
+
+        const duration = (Date.now() - start) / 1000;
+        await addRequestLog(c.env.DB, {
+          ip,
+          model: requestedModel,
+          duration: Number(duration.toFixed(2)),
+          status: 200,
+          key_name: keyName,
+          token_suffix: jwt.slice(-6),
+          error: "",
+        });
+
+        return c.json(responseJson);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        lastErr = msg;
+        await recordTokenFailure(c.env.DB, jwt, 500, msg);
+        await applyCooldown(c.env.DB, jwt, 500);
+        if (attempt < maxRetry - 1) continue;
+      }
+    }
+
+    const duration = (Date.now() - start) / 1000;
+    await addRequestLog(c.env.DB, {
+      ip,
+      model: requestedModel,
+      duration: Number(duration.toFixed(2)),
+      status: 500,
+      key_name: keyName,
+      token_suffix: "",
+      error: lastErr ?? "unknown_error",
+    });
+
+    return c.json(openAiError(lastErr ?? "Upstream error", "upstream_error"), 500);
+  } catch (e) {
+    const duration = (Date.now() - start) / 1000;
+    await addRequestLog(c.env.DB, {
+      ip,
+      model: requestedModel || "unknown",
+      duration: Number(duration.toFixed(2)),
+      status: 500,
+      key_name: keyName,
+      token_suffix: "",
+      error: e instanceof Error ? e.message : String(e),
+    });
+    return c.json(openAiError("Internal error", "internal_error"), 500);
+  }
+});
+
 openAiRoutes.post("/images/generations", async (c) => {
   const start = Date.now();
   const ip = getClientIp(c.req.raw);
@@ -1451,7 +2158,7 @@ openAiRoutes.post("/images/generations", async (c) => {
       kind: "image",
       imageCount: n,
     });
-    if (!quota.ok) return quota.resp;
+    if (quota.ok === false) return quota.resp;
 
     if (stream) {
       if (imageMethod === IMAGE_METHOD_IMAGINE_WS_EXPERIMENTAL) {
@@ -1716,7 +2423,7 @@ openAiRoutes.post("/images/edits", async (c) => {
       kind: "image",
       imageCount: n,
     });
-    if (!quota.ok) return quota.resp;
+    if (quota.ok === false) return quota.resp;
 
     const chosen = await selectBestToken(c.env.DB, requestedModel);
     if (!chosen) {
