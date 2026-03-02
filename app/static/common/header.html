@@ -1,8 +1,8 @@
 <nav class="app-nav bg-[var(--bg)]/80 backdrop-blur-md fixed top-0 left-0 right-0 z-10">
   <div class="app-nav-inner max-w-4xl mx-auto px-6 h-14 flex items-center justify-between">
     <div class="nav-left flex items-center gap-6">
-      <div class="flex flex-col gap-0.5 leading-tight">
-        <div class="flex items-center gap-2">
+      <div class="brand-stack leading-tight">
+        <div class="brand-row">
           <a href="https://github.com/TQZHR/grok2api" target="_blank" rel="noopener"
             class="brand-link font-semibold tracking-tight hover:text-black">
             <svg class="github-icon" viewBox="0 0 24 24" aria-hidden="true">
@@ -11,11 +11,12 @@
             </svg>
             <span>Grok2API</span>
           </a>
+          <span id="build-version-badge" class="nav-badge nav-version-badge" title="Build Version">v-dev</span>
           <a href="https://github.com/TQZHR" target="_blank" rel="noopener"
             class="text-xs text-[var(--accents-4)] hover:text-black">@Cc</a>
         </div>
         <a href="https://github.com/chenyme/grok2api" target="_blank" rel="noopener"
-          class="text-xs text-[var(--accents-4)] hover:text-black">原作者仓库 @chenyme @TQZHR</a>
+          class="origin-repo-link text-xs text-[var(--accents-4)] hover:text-black">原作者仓库 @chenyme @TQZHR</a>
       </div>
       <div class="nav-divider h-4 w-px bg-[var(--border)]"></div>
       <div class="nav-desktop-links flex items-center gap-6">

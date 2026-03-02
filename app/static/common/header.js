@@ -87,6 +87,23 @@ async function loadAdminHeader() {
     if (typeof updateStorageModeButton === 'function') {
       updateStorageModeButton();
     }
+    try {
+      const badge = container.querySelector('#build-version-badge');
+      if (badge) {
+        const sp = new URLSearchParams(window.location.search || '');
+        const v = (sp.get('v') || '').trim();
+        if (v) {
+          const short = v.slice(0, 7);
+          badge.textContent = `v-${short}`;
+          badge.setAttribute('title', `Build ${v}`);
+        } else {
+          badge.textContent = 'v-dev';
+          badge.setAttribute('title', 'Build dev');
+        }
+      }
+    } catch (e) {
+      // ignore version badge parse failure
+    }
   } catch (e) {
     // Fail silently to avoid breaking page load
   }
