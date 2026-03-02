@@ -853,6 +853,26 @@ adminRoutes.post("/api/v1/admin/tokens/refresh", requireAdminAuth, async (c) => 
   }
 });
 
+adminRoutes.post("/api/v1/admin/tokens/auto-register", requireAdminAuth, async (c) => {
+  return c.json(legacyErr("Cloudflare Worker runtime does not support built-in auto-register execution. Please use Docker/Python register service and keep this UI for compatibility."), 501);
+});
+
+adminRoutes.get("/api/v1/admin/tokens/auto-register/status", requireAdminAuth, async (c) => {
+  return c.json({
+    status: "idle",
+    runtime: "cloudflare-workers",
+    message: "Auto-register worker job is not available in Cloudflare Worker runtime.",
+  });
+});
+
+adminRoutes.post("/api/v1/admin/tokens/auto-register/stop", requireAdminAuth, async (c) => {
+  return c.json({
+    status: "idle",
+    runtime: "cloudflare-workers",
+    message: "No running auto-register job in Cloudflare Worker runtime.",
+  });
+});
+
 adminRoutes.post("/api/v1/admin/tokens/nsfw/refresh", requireAdminAuth, async (c) => {
   try {
     const body = (await c.req.json()) as any;

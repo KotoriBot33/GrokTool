@@ -219,14 +219,10 @@ async function detectWorkersRuntime() {
 }
 
 async function applyRuntimeUiFlags() {
-  // Default hide first; show back for local/docker after detection.
-  setAutoRegisterUiEnabled(false);
-  setNsfwRefreshUiEnabled(false);
+  // Always show both features on all runtimes; Worker keeps API compatibility via backend responses.
+  setAutoRegisterUiEnabled(true);
+  setNsfwRefreshUiEnabled(true);
   isWorkersRuntime = await detectWorkersRuntime();
-  if (!isWorkersRuntime) {
-    setAutoRegisterUiEnabled(true);
-    setNsfwRefreshUiEnabled(true);
-  }
 }
 
 if (document.readyState === 'loading') {

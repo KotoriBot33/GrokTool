@@ -124,6 +124,15 @@ app.get("/admin/token", (c) => {
   return fetchAsset(c, "/token/token.html");
 });
 
+app.get("/admin/register", (c) => {
+  const buildSha = getBuildSha(c.env as Env);
+  const v = c.req.query("v") ?? "";
+  if (v !== buildSha) {
+    return c.redirect(`/admin/register?v=${encodeURIComponent(buildSha)}`, 302);
+  }
+  return fetchAsset(c, "/token/token.html");
+});
+
 app.get("/admin/datacenter", (c) => {
   const buildSha = getBuildSha(c.env as Env);
   const v = c.req.query("v") ?? "";

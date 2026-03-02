@@ -45,16 +45,16 @@
       </div>
     </div>
 
-    <div id="nsfw-flow-hint" class="card hidden">
+    <div id="nsfw-flow-hint" class="card">
       <div class="flex items-center justify-between gap-3 flex-wrap">
-        <div class="text-sm text-[var(--accents-7)]">检测到账号可能未完成协议/年龄/NSFW 设置。</div>
+        <div class="text-sm text-[var(--accents-7)]">账号协议/年龄/NSFW 可在此手动触发修复。</div>
         <div class="flex items-center gap-2">
           <button class="geist-button-outline text-xs px-3" onclick="hideNsfwFlowHint()">忽略</button>
           <button id="nsfw-flow-repair-btn" class="geist-button text-xs px-3" onclick="runNsfwFlowRepair()">一键修复</button>
           <button class="geist-button text-xs px-3" onclick="openNsfwRefreshPage()">前往 Token 管理修复</button>
         </div>
       </div>
-      <div id="nsfw-flow-detail" class="text-xs text-[var(--accents-5)] mt-2"></div>
+      <div id="nsfw-flow-detail" class="text-xs text-[var(--accents-5)] mt-2">状态：可手动执行修复；若聊天返回 NSFW/年龄/TOS 错误会在这里显示具体原因。</div>
     </div>
 
     <div class="card">
