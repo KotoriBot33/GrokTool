@@ -176,6 +176,8 @@ function findTokenIndexByKey(tokenKey) {
   return flatTokens.findIndex((t) => getTokenKey(t.token) === key);
 }
 
+const IMPORT_API_CHUNK_SIZE = 200;
+
 async function importTokensIncremental({ pool, tokens, quota = 80, note = '' }) {
   const normalizedTokens = [...new Set((tokens || [])
     .map((t) => normalizeSsoToken(String(t || '').trim()))
@@ -184,36 +186,44 @@ async function importTokensIncremental({ pool, tokens, quota = 80, note = '' }) 
     return { added: 0, skipped: 0, total: 0 };
   }
 
-  const payload = {
-    pool: (pool || 'ssoBasic').trim() || 'ssoBasic',
-    tokens: normalizedTokens,
-    quota,
-    note: String(note || '').trim().slice(0, 50)
-  };
+  const poolName = (pool || 'ssoBasic').trim() || 'ssoBasic';
+  let added = 0;
+  let skipped = 0;
+  let total = 0;
 
-  const res = await fetch('/api/v1/admin/tokens/import', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...buildAuthHeaders(apiKey)
-    },
-    body: JSON.stringify(payload)
-  });
+  for (let i = 0; i < normalizedTokens.length; i += IMPORT_API_CHUNK_SIZE) {
+    const chunk = normalizedTokens.slice(i, i + IMPORT_API_CHUNK_SIZE);
+    const payload = {
+      pool: poolName,
+      tokens: chunk,
+      quota,
+      note: String(note || '').trim().slice(0, 50)
+    };
 
-  const data = await parseJsonSafely(res);
-  if (res.status === 401) {
-    logout();
-    return null;
+    const res = await fetch('/api/v1/admin/tokens/import', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...buildAuthHeaders(apiKey)
+      },
+      body: JSON.stringify(payload)
+    });
+
+    const data = await parseJsonSafely(res);
+    if (res.status === 401) {
+      logout();
+      return null;
+    }
+    if (!res.ok) {
+      throw new Error(extractApiErrorMessage(data, `导入失败: HTTP ${res.status}`));
+    }
+
+    added += Number(data?.added || 0);
+    skipped += Number(data?.skipped || 0);
+    total += Number(data?.total || chunk.length);
   }
-  if (!res.ok) {
-    throw new Error(extractApiErrorMessage(data, `导入失败: HTTP ${res.status}`));
-  }
 
-  return {
-    added: Number(data?.added || 0),
-    skipped: Number(data?.skipped || 0),
-    total: Number(data?.total || normalizedTokens.length),
-  };
+  return { added, skipped, total };
 }
 
 function refreshFilterStateFromDom() {

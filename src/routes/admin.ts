@@ -868,15 +868,19 @@ adminRoutes.post("/api/v1/admin/tokens/import", requireAdminAuth, async (c) => {
     const normalized = [...new Set(rawTokens.map((t) => normalizeSsoToken(String(t))).filter(Boolean))];
     if (!normalized.length) return c.json(legacyErr("No tokens provided"), 400);
 
-    const placeholders = normalized.map(() => "?").join(",");
-    const existingRows = placeholders
-      ? await dbAll<{ token: string }>(
-          c.env.DB,
-          `SELECT token FROM tokens WHERE token IN (${placeholders})`,
-          normalized,
-        )
-      : [];
-    const existingSet = new Set(existingRows.map((r) => r.token));
+    const existingSet = new Set<string>();
+    const CHECK_CHUNK_SIZE = 500;
+    for (let i = 0; i < normalized.length; i += CHECK_CHUNK_SIZE) {
+      const chunk = normalized.slice(i, i + CHECK_CHUNK_SIZE);
+      const placeholders = chunk.map(() => "?").join(",");
+      if (!placeholders) continue;
+      const rows = await dbAll<{ token: string }>(
+        c.env.DB,
+        `SELECT token FROM tokens WHERE token IN (${placeholders})`,
+        chunk,
+      );
+      for (const row of rows) existingSet.add(row.token);
+    }
 
     const quotaRaw = Number(body?.quota);
     const quota = Number.isFinite(quotaRaw) && quotaRaw >= 0 ? Math.floor(quotaRaw) : 80;
@@ -901,8 +905,9 @@ adminRoutes.post("/api/v1/admin/tokens/import", requireAdminAuth, async (c) => {
       added += 1;
     }
 
-    if (stmts.length) {
-      await c.env.DB.batch(stmts);
+    const INSERT_BATCH_SIZE = 200;
+    for (let i = 0; i < stmts.length; i += INSERT_BATCH_SIZE) {
+      await c.env.DB.batch(stmts.slice(i, i + INSERT_BATCH_SIZE));
     }
 
     return c.json(
